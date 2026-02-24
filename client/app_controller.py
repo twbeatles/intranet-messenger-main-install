@@ -17,7 +17,7 @@ from PySide6.QtCore import QObject, QSettings, QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 from client.i18n import i18n_manager, t
-from client.services.api_client import APIClient
+from client.services.api_client import APIClient, ApiError
 from client.services.crypto_compat import CryptoError, decrypt_message, encrypt_message
 from client.services.session_store import SessionStore, StoredSession
 from client.services.socket_client import SocketClient
@@ -145,8 +145,8 @@ class MessengerAppController(QObject):
         self.socket.on('room_members_updated', self._on_socket_room_members_updated)
         self.socket.on('read_updated', self._on_socket_read_updated)
         self.socket.on('user_typing', self._on_socket_user_typing)
-        self.socket.on('message_edited', self._on_socket_message_mutated)
-        self.socket.on('message_deleted', self._on_socket_message_mutated)
+        self.socket.on('message_edited', self._on_socket_message_edited)
+        self.socket.on('message_deleted', self._on_socket_message_deleted)
         self.socket.on('reaction_updated', self._on_socket_reaction_updated)
         self.socket.on('poll_updated', self._on_socket_poll_updated)
         self.socket.on('poll_created', self._on_socket_poll_updated)
@@ -179,8 +179,6 @@ class MessengerAppController(QObject):
         try:
             startup_initialized = bool(self._settings.value('startup/initialized', False, type=bool))
             if not startup_initialized:
-                if not self.startup_manager.is_enabled():
-                    self.startup_manager.set_enabled(True)
                 self._settings.setValue('startup/initialized', True)
         except Exception:
             pass
@@ -209,8 +207,14 @@ class MessengerAppController(QObject):
                 device_token=rotated,
             )
             return True
+        except ApiError as exc:
+            if int(getattr(exc, 'status_code', 0)) == 401 or getattr(exc, 'error_code', '') in (
+                'AUTH_TOKEN_INVALID_OR_EXPIRED',
+                'AUTH_DEVICE_TOKEN_REQUIRED',
+            ):
+                self.session_store.clear()
+            return False
         except Exception:
-            self.session_store.clear()
             return False
 
     def _on_login_requested(
@@ -467,19 +471,26 @@ class MessengerAppController(QObject):
 
             file_name = upload.get('file_name') or Path(local_path).name
             message_type = self._guess_message_type(file_name, upload.get('file_type'))
-            self.socket.send_message(
-                {
-                    'room_id': int(self.current_room_id),
-                    'content': file_name,
-                    'type': message_type,
-                    'upload_token': token,
-                    'encrypted': False,
-                }
-            )
-            self.tray.notify(
-                t('app.name', 'Intranet Messenger'),
-                t('files.upload', 'Upload') + f': {file_name}',
-            )
+            client_msg_id = uuid.uuid4().hex
+            payload = {
+                'room_id': int(self.current_room_id),
+                'content': file_name,
+                'type': message_type,
+                'upload_token': token,
+                'encrypted': False,
+                'client_msg_id': client_msg_id,
+            }
+            self._pending_sends[client_msg_id] = {
+                'payload': payload,
+                'created_at': time.monotonic(),
+                'last_attempt_at': 0.0,
+                'retry_count': 0,
+                'failed': False,
+                'is_file': True,
+                'file_name': file_name,
+            }
+            self._dispatch_pending_send(client_msg_id)
+            self._refresh_delivery_state()
         except Exception as exc:
             self.main_window.show_error(str(exc))
 
@@ -502,6 +513,13 @@ class MessengerAppController(QObject):
         if not entry:
             return
         if bool(ack.get('ok')):
+            if bool(entry.get('is_file')):
+                file_name = str(entry.get('file_name') or '')
+                if file_name:
+                    self.tray.notify(
+                        t('app.name', 'Intranet Messenger'),
+                        t('files.upload', 'Upload') + f': {file_name}',
+                    )
             self._pending_sends.pop(client_msg_id, None)
             if client_msg_id in self._failed_send_ids:
                 self._failed_send_ids.remove(client_msg_id)
@@ -647,7 +665,6 @@ class MessengerAppController(QObject):
     def _on_socket_read_updated(self, payload: dict[str, Any]) -> None:
         room_id = self._extract_room_id(payload)
         if room_id and self.current_room_id == room_id:
-            self._reload_current_room_messages(silent=True)
             self._set_room_unread(room_id, 0)
             self.main_window.set_rooms(self.rooms_cache)
 
@@ -655,18 +672,57 @@ class MessengerAppController(QObject):
         room_id = self._extract_room_id(payload)
         if not room_id or self.current_room_id != room_id:
             return
+        user_id = int(payload.get('user_id') or 0)
         nickname = str(payload.get('nickname') or '')
         is_typing = bool(payload.get('is_typing'))
-        self.main_window.set_typing_user(nickname, is_typing)
+        self.main_window.set_typing_user(user_id, nickname, is_typing)
 
-    def _on_socket_message_mutated(self, _payload: dict[str, Any]) -> None:
-        self._reload_current_room_messages(silent=True)
+    def _on_socket_message_edited(self, payload: dict[str, Any]) -> None:
+        room_id = self._extract_room_id(payload)
+        if not room_id:
+            return
+        if self.current_room_id and room_id == int(self.current_room_id):
+            message_id = int(payload.get('message_id') or 0)
+            content = str(payload.get('content') or '')
+            encrypted = bool(payload.get('encrypted', False))
+            display_content = content
+            if encrypted and self.current_room_key:
+                try:
+                    display_content = decrypt_message(content, self.current_room_key)
+                except CryptoError:
+                    display_content = t('app.messages.encrypted', '[encrypted message]')
+            updated = self.main_window.update_message_content(
+                message_id=message_id,
+                content=content,
+                display_content=display_content,
+                encrypted=encrypted,
+            )
+            if not updated:
+                self._reload_current_room_messages(silent=True)
+        self._schedule_rooms_reload(250)
+
+    def _on_socket_message_deleted(self, payload: dict[str, Any]) -> None:
+        room_id = self._extract_room_id(payload)
+        if not room_id:
+            return
+        if self.current_room_id and room_id == int(self.current_room_id):
+            message_id = int(payload.get('message_id') or 0)
+            updated = self.main_window.mark_message_deleted(message_id)
+            if not updated:
+                self._reload_current_room_messages(silent=True)
         self._schedule_rooms_reload(250)
 
     def _on_socket_reaction_updated(self, payload: dict[str, Any]) -> None:
         room_id = self._extract_room_id(payload)
         if room_id and self.current_room_id == room_id:
-            self._reload_current_room_messages(silent=True)
+            message_id = int(payload.get('message_id') or 0)
+            reactions = payload.get('reactions')
+            updated = self.main_window.update_message_reactions(
+                message_id=message_id,
+                reactions=reactions if isinstance(reactions, list) else [],
+            )
+            if not updated:
+                self._reload_current_room_messages(silent=True)
 
     def _on_socket_poll_updated(self, payload: dict[str, Any]) -> None:
         room_id = self._extract_room_id(payload)
@@ -676,7 +732,8 @@ class MessengerAppController(QObject):
     def _on_socket_pin_updated(self, payload: dict[str, Any]) -> None:
         room_id = self._extract_room_id(payload)
         if room_id and self.current_room_id == room_id:
-            self._reload_current_room_messages(silent=True)
+            # Pins are managed in dedicated dialogs/APIs; avoid full message reload.
+            pass
 
     def _on_socket_admin_updated(self, payload: dict[str, Any]) -> None:
         room_id = self._extract_room_id(payload)

@@ -73,6 +73,7 @@ class MainWindow(QMainWindow):
         self.minimize_to_tray = True
         self._room_id_by_row: dict[int, int] = {}
         self._user_aliases: set[str] = set()
+        self._current_user_id: int = 0
         self._current_room_name = t('main.select_room', 'Select a room')
         self._room_meta_base = t('main.select_room_desc', 'Choose a conversation from the left list.')
         self._typing_user = ''
@@ -265,6 +266,10 @@ class MainWindow(QMainWindow):
     def set_user(self, user: dict[str, Any]) -> None:
         nickname = user.get('nickname') or user.get('username') or t('common.unknown', 'Unknown')
         username = user.get('username')
+        try:
+            self._current_user_id = int(user.get('id') or 0)
+        except (TypeError, ValueError):
+            self._current_user_id = 0
         if username and username != nickname:
             self.user_label.setText(f'{nickname} (@{username})')
         else:
@@ -504,6 +509,27 @@ class MainWindow(QMainWindow):
         self._insert_message_item(message, at_top=False)
 
     def _insert_message_item(self, message: dict[str, Any], *, at_top: bool) -> None:
+        message_copy = dict(message or {})
+        container = self._build_message_container(message_copy)
+        message_id = 0
+        try:
+            message_id = int(message_copy.get('id') or 0)
+        except Exception:
+            message_id = 0
+
+        item = QListWidgetItem()
+        if message_id > 0:
+            item.setData(Qt.ItemDataRole.UserRole, int(message_id))
+            item.setData(Qt.ItemDataRole.UserRole + 1, message_copy)
+        item.setSizeHint(container.sizeHint())
+        if at_top:
+            insert_row = 1 if self._has_history_banner() else 0
+            self.messages_list.insertItem(insert_row, item)
+        else:
+            self.messages_list.addItem(item)
+        self.messages_list.setItemWidget(item, container)
+
+    def _build_message_container(self, message: dict[str, Any]) -> QWidget:
         sender = str(
             message.get('sender_name')
             or message.get('sender_id')
@@ -514,8 +540,11 @@ class MainWindow(QMainWindow):
         reply_sender = str(message.get('reply_sender') or '')
         reply_content = str(message.get('reply_content') or '')
         reactions = message.get('reactions') or []
-        
-        is_own = sender in self._user_aliases
+        try:
+            sender_id = int(message.get('sender_id') or 0)
+        except (TypeError, ValueError):
+            sender_id = 0
+        is_own = sender_id > 0 and sender_id == self._current_user_id
 
         container = QWidget()
         container.setStyleSheet("background: transparent;")
@@ -580,30 +609,102 @@ class MainWindow(QMainWindow):
             avatar_label.setFixedSize(40, 40)
             avatar_label.setAlignment(Qt.AlignCenter)
             avatar_label.setStyleSheet("background-color: #cbd5e1; color: #ffffff; border-radius: 20px; font-weight: bold; font-size: 14pt;")
-            
+
             avatar_layout = QVBoxLayout()
             avatar_layout.addWidget(avatar_label)
             avatar_layout.addStretch()
-            
+
             container_layout.addLayout(avatar_layout)
             container_layout.addWidget(bubble)
             container_layout.addLayout(time_layout)
             container_layout.addStretch()
 
-        item = QListWidgetItem()
-        try:
-            message_id = int(message.get('id') or 0)
-        except Exception:
-            message_id = 0
-        if message_id > 0:
-            item.setData(Qt.ItemDataRole.UserRole, message_id)
-        item.setSizeHint(container.sizeHint())
-        if at_top:
-            insert_row = 1 if self._has_history_banner() else 0
-            self.messages_list.insertItem(insert_row, item)
-        else:
-            self.messages_list.addItem(item)
-        self.messages_list.setItemWidget(item, container)
+        return container
+
+    def _find_message_row(self, message_id: int) -> int:
+        if message_id <= 0:
+            return -1
+        start = 1 if self._has_history_banner() else 0
+        for row in range(start, self.messages_list.count()):
+            item = self.messages_list.item(row)
+            if not item:
+                continue
+            try:
+                current_id = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+            except (TypeError, ValueError):
+                current_id = 0
+            if current_id == message_id:
+                return row
+        return -1
+
+    def _replace_message_item(self, row: int, message: dict[str, Any]) -> bool:
+        if row < 0 or row >= self.messages_list.count():
+            return False
+        item = self.messages_list.item(row)
+        if not item:
+            return False
+        item.setData(Qt.ItemDataRole.UserRole + 1, dict(message))
+        widget = self._build_message_container(dict(message))
+        item.setSizeHint(widget.sizeHint())
+        self.messages_list.setItemWidget(item, widget)
+        return True
+
+    def update_message_reactions(self, message_id: int, reactions: list[dict[str, Any]]) -> bool:
+        row = self._find_message_row(message_id)
+        if row < 0:
+            return False
+        item = self.messages_list.item(row)
+        if not item:
+            return False
+        stored = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(stored, dict):
+            return False
+        updated = dict(stored)
+        updated['reactions'] = reactions
+        return self._replace_message_item(row, updated)
+
+    def update_message_content(
+        self,
+        *,
+        message_id: int,
+        content: str,
+        display_content: str,
+        encrypted: bool,
+    ) -> bool:
+        row = self._find_message_row(message_id)
+        if row < 0:
+            return False
+        item = self.messages_list.item(row)
+        if not item:
+            return False
+        stored = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(stored, dict):
+            return False
+        updated = dict(stored)
+        updated['content'] = content
+        updated['display_content'] = display_content
+        updated['encrypted'] = bool(encrypted)
+        return self._replace_message_item(row, updated)
+
+    def mark_message_deleted(self, message_id: int) -> bool:
+        row = self._find_message_row(message_id)
+        if row < 0:
+            return False
+        item = self.messages_list.item(row)
+        if not item:
+            return False
+        stored = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(stored, dict):
+            return False
+        updated = dict(stored)
+        deleted_text = t('main.message_deleted', '[deleted message]')
+        updated['content'] = deleted_text
+        updated['display_content'] = deleted_text
+        updated['encrypted'] = False
+        updated['file_path'] = ''
+        updated['file_name'] = ''
+        updated['message_type'] = 'text'
+        return self._replace_message_item(row, updated)
 
     def _on_messages_scrolled(self, value: int) -> None:
         if self._history_scroll_blocked or value > 2 or not self._history_has_more or self._history_loading:
@@ -663,9 +764,9 @@ class MainWindow(QMainWindow):
 
         banner.setText(t('main.history_reached_start', 'Reached the beginning of the conversation'))
 
-    def set_typing_user(self, nickname: str, is_typing: bool) -> None:
+    def set_typing_user(self, user_id: int, nickname: str, is_typing: bool) -> None:
         sender = (nickname or '').strip()
-        if sender and sender in self._user_aliases:
+        if int(user_id or 0) == int(self._current_user_id):
             sender = ''
         self._typing_user = sender if is_typing else ''
         self._update_room_meta_label()

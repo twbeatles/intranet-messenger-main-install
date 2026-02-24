@@ -15,6 +15,13 @@ import httpx
 from client.i18n import t
 
 
+class ApiError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int, error_code: str = ''):
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.error_code = str(error_code or '')
+
+
 class APIClient:
     def __init__(self, base_url: str, timeout: float = 15.0, language_getter=None):
         self.base_url = base_url.rstrip('/')
@@ -71,11 +78,13 @@ class APIClient:
             payload = response.json()
 
         if response.status_code >= 400:
+            error_code = ''
             if isinstance(payload, dict):
                 message = payload.get('error_localized') or payload.get('error') or f'HTTP {response.status_code}'
+                error_code = str(payload.get('error_code') or '')
             else:
                 message = f'HTTP {response.status_code}'
-            raise RuntimeError(message)
+            raise ApiError(str(message), status_code=response.status_code, error_code=error_code)
 
         return payload
 
@@ -151,8 +160,9 @@ class APIClient:
             headers=headers,
         )
 
-    def get_device_sessions(self) -> list[dict[str, Any]]:
-        payload = self._request('GET', '/api/device-sessions')
+    def get_device_sessions(self, include_expired: bool = False) -> list[dict[str, Any]]:
+        params = {'include_expired': 1} if include_expired else None
+        payload = self._request('GET', '/api/device-sessions', params=params)
         return payload.get('sessions', [])
 
     def revoke_device_session(self, session_id: int) -> dict[str, Any]:
@@ -292,7 +302,9 @@ class APIClient:
             )
         payload = response.json() if 'application/json' in response.headers.get('content-type', '') else {}
         if response.status_code >= 400:
-            raise RuntimeError(payload.get('error_localized') or payload.get('error') or f'HTTP {response.status_code}')
+            message = payload.get('error_localized') or payload.get('error') or f'HTTP {response.status_code}'
+            error_code = str(payload.get('error_code') or '') if isinstance(payload, dict) else ''
+            raise ApiError(str(message), status_code=response.status_code, error_code=error_code)
         return payload
 
     def download_upload_file(self, remote_file_path: str, save_path: str) -> str:
@@ -300,7 +312,9 @@ class APIClient:
         response = self._client.get(f'/uploads/{encoded_path}', headers=self._headers())
         if response.status_code >= 400:
             payload = response.json() if 'application/json' in response.headers.get('content-type', '') else {}
-            raise RuntimeError(payload.get('error_localized') or payload.get('error') or f'HTTP {response.status_code}')
+            message = payload.get('error_localized') or payload.get('error') or f'HTTP {response.status_code}'
+            error_code = str(payload.get('error_code') or '') if isinstance(payload, dict) else ''
+            raise ApiError(str(message), status_code=response.status_code, error_code=error_code)
 
         output = Path(save_path)
         output.parent.mkdir(parents=True, exist_ok=True)
