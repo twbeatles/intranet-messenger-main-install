@@ -95,6 +95,29 @@ def register_routes(app):
             except Exception:
                 normalized.append(0)
         return tuple(normalized)  # type: ignore[return-value]
+
+    def _emit_socket_event(
+        event: str,
+        payload: dict | None = None,
+        *,
+        room_id: int | None = None,
+        broadcast: bool = False,
+    ) -> None:
+        """REST 처리 결과를 소켓으로 동기화한다."""
+        try:
+            from app import socketio as socketio_instance
+        except Exception:
+            return
+
+        if socketio_instance is None:
+            return
+
+        kwargs: dict[str, object] = {}
+        if room_id is not None:
+            kwargs['room'] = f'room_{int(room_id)}'
+        # Flask-SocketIO server emit defaults to all clients when room is not provided.
+        _ = broadcast
+        socketio_instance.emit(event, payload or {}, **kwargs)
     
     @app.route('/')
     def index():
@@ -538,6 +561,15 @@ def register_routes(app):
         
         try:
             room_id = create_room(name, room_type, session['user_id'], member_ids)
+            _emit_socket_event(
+                'room_updated',
+                {
+                    'room_id': room_id,
+                    'action': 'room_created',
+                    'by_user_id': int(session['user_id']),
+                },
+                broadcast=True,
+            )
             return jsonify({'success': True, 'room_id': room_id})
         except Exception as e:
             logger.error(f"Room creation failed: {e}")
@@ -640,6 +672,25 @@ def register_routes(app):
                 added += 1
         
         if added > 0:
+            _emit_socket_event(
+                'room_members_updated',
+                {
+                    'room_id': room_id,
+                    'action': 'members_invited',
+                    'by_user_id': int(session['user_id']),
+                    'added_count': added,
+                },
+                room_id=room_id,
+            )
+            _emit_socket_event(
+                'room_updated',
+                {
+                    'room_id': room_id,
+                    'action': 'members_invited',
+                    'by_user_id': int(session['user_id']),
+                },
+                broadcast=True,
+            )
             return jsonify({'success': True, 'added_count': added})
         return jsonify({'error': '이미 참여중인 사용자입니다.'}), 400
     
@@ -649,6 +700,25 @@ def register_routes(app):
             return jsonify({'error': '로그인이 필요합니다.'}), 401
         
         leave_room_db(room_id, session['user_id'])
+        _emit_socket_event(
+            'room_members_updated',
+            {
+                'room_id': room_id,
+                'action': 'member_left',
+                'user_id': int(session['user_id']),
+                'by_user_id': int(session['user_id']),
+            },
+            room_id=room_id,
+        )
+        _emit_socket_event(
+            'room_updated',
+            {
+                'room_id': room_id,
+                'action': 'member_left',
+                'user_id': int(session['user_id']),
+            },
+            broadcast=True,
+        )
         return jsonify({'success': True})
     
     @app.route('/api/rooms/<int:room_id>/members/<int:target_user_id>', methods=['DELETE'])
@@ -674,6 +744,26 @@ def register_routes(app):
             return jsonify({'error': '해당 사용자는 대화방 멤버가 아닙니다.'}), 400
         
         leave_room_db(room_id, target_user_id)
+        _emit_socket_event(
+            'room_members_updated',
+            {
+                'room_id': room_id,
+                'action': 'member_kicked',
+                'user_id': int(target_user_id),
+                'by_user_id': int(session['user_id']),
+            },
+            room_id=room_id,
+        )
+        _emit_socket_event(
+            'room_updated',
+            {
+                'room_id': room_id,
+                'action': 'member_kicked',
+                'user_id': int(target_user_id),
+                'by_user_id': int(session['user_id']),
+            },
+            broadcast=True,
+        )
         return jsonify({'success': True})
     
     @app.route('/api/rooms/<int:room_id>/name', methods=['PUT'])
@@ -693,6 +783,25 @@ def register_routes(app):
             return jsonify({'error': '대화방 이름을 입력해주세요.'}), 400
         
         update_room_name(room_id, new_name)
+        _emit_socket_event(
+            'room_name_updated',
+            {
+                'room_id': room_id,
+                'name': new_name,
+                'by_user_id': int(session['user_id']),
+            },
+            room_id=room_id,
+        )
+        _emit_socket_event(
+            'room_updated',
+            {
+                'room_id': room_id,
+                'action': 'room_renamed',
+                'name': new_name,
+                'by_user_id': int(session['user_id']),
+            },
+            broadcast=True,
+        )
         return jsonify({'success': True})
     
     # NOTE: /pin-room is the explicit alias; /pin is kept for backwards compatibility.
@@ -1051,7 +1160,7 @@ def register_routes(app):
             return jsonify({'error': '프로필 이미지 데이터베이스 업데이트 실패'}), 500
         except Exception as e:
             logger.error(f"Profile update error: {e}")
-            return jsonify({'error': f'프로필 처리 중 오류가 발생했습니다: {str(e)}'}), 500
+            return jsonify({'error': '프로필 처리 중 오류가 발생했습니다.'}), 500
     
     @app.route('/api/profile/image', methods=['DELETE'])
     def delete_profile_image():
@@ -1106,6 +1215,16 @@ def register_routes(app):
         
         pin_id = pin_message(room_id, session['user_id'], message_id, content)
         if pin_id:
+            _emit_socket_event(
+                'pin_updated',
+                {
+                    'room_id': room_id,
+                    'pin_id': pin_id,
+                    'action': 'pin_created',
+                    'by_user_id': int(session['user_id']),
+                },
+                room_id=room_id,
+            )
             return jsonify({'success': True, 'pin_id': pin_id})
         return jsonify({'error': '공지 고정에 실패했습니다.'}), 500
     
@@ -1120,6 +1239,16 @@ def register_routes(app):
         
         success, error = unpin_message(pin_id, session['user_id'], room_id)
         if success:
+            _emit_socket_event(
+                'pin_updated',
+                {
+                    'room_id': room_id,
+                    'pin_id': pin_id,
+                    'action': 'pin_deleted',
+                    'by_user_id': int(session['user_id']),
+                },
+                room_id=room_id,
+            )
             return jsonify({'success': True})
         if error == '공지를 찾을 수 없습니다.':
             return jsonify({'error': error}), 404
@@ -1180,6 +1309,16 @@ def register_routes(app):
         if poll_id:
             poll = get_poll(poll_id)
             if poll:
+                _emit_socket_event(
+                    'poll_created',
+                    {
+                        'room_id': room_id,
+                        'poll': poll,
+                        'action': 'poll_created',
+                        'by_user_id': int(session['user_id']),
+                    },
+                    room_id=room_id,
+                )
                 return jsonify({'success': True, 'poll': poll})
             logger.error(f"Poll created but lookup failed: poll_id={poll_id}")
             return jsonify({'error': '투표 생성 후 조회에 실패했습니다.'}), 500
@@ -1225,6 +1364,16 @@ def register_routes(app):
         if success:
             poll = get_poll(poll_id)
             poll['my_votes'] = get_user_votes(poll_id, session['user_id'])
+            _emit_socket_event(
+                'poll_updated',
+                {
+                    'room_id': int(poll.get('room_id') or 0),
+                    'poll': poll,
+                    'action': 'poll_voted',
+                    'by_user_id': int(session['user_id']),
+                },
+                room_id=int(poll.get('room_id') or 0),
+            )
             return jsonify({'success': True, 'poll': poll})
         return jsonify({'error': error}), 400
     
@@ -1244,6 +1393,18 @@ def register_routes(app):
         is_admin = is_room_admin(poll['room_id'], session['user_id'])
         success, error = close_poll(poll_id, session['user_id'], is_admin=is_admin)
         if success:
+            updated_poll = get_poll(poll_id)
+            if updated_poll:
+                _emit_socket_event(
+                    'poll_updated',
+                    {
+                        'room_id': int(updated_poll.get('room_id') or 0),
+                        'poll': updated_poll,
+                        'action': 'poll_closed',
+                        'by_user_id': int(session['user_id']),
+                    },
+                    room_id=int(updated_poll.get('room_id') or 0),
+                )
             return jsonify({'success': True})
         return jsonify({'error': error or '투표 마감에 실패했습니다.'}), 403
     
@@ -1346,6 +1507,27 @@ def register_routes(app):
                 return jsonify({'error': '최소 한 명의 관리자가 필요합니다.'}), 400
         
         if set_room_admin(room_id, target_user_id, is_admin):
+            _emit_socket_event(
+                'admin_updated',
+                {
+                    'room_id': room_id,
+                    'user_id': int(target_user_id),
+                    'is_admin': bool(is_admin),
+                    'by_user_id': int(session['user_id']),
+                },
+                room_id=room_id,
+            )
+            _emit_socket_event(
+                'room_members_updated',
+                {
+                    'room_id': room_id,
+                    'action': 'admin_updated',
+                    'user_id': int(target_user_id),
+                    'is_admin': bool(is_admin),
+                    'by_user_id': int(session['user_id']),
+                },
+                room_id=room_id,
+            )
             return jsonify({'success': True})
         return jsonify({'error': '관리자 설정에 실패했습니다.'}), 500
     

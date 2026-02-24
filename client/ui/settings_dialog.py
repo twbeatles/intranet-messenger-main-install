@@ -23,7 +23,7 @@ from client.i18n import i18n_manager, t
 
 
 class SettingsDialog(QDialog):
-    save_requested = Signal(str, bool, bool, str)  # server_url, startup_enabled, minimize_to_tray, language_preference
+    save_requested = Signal(str, bool, bool, str, str)  # server_url, startup_enabled, minimize_to_tray, language_preference, update_channel
     check_update_requested = Signal()
 
     def __init__(self, parent=None):
@@ -60,12 +60,16 @@ class SettingsDialog(QDialog):
         self.tray_check.setChecked(True)
         self.language_combo = QComboBox()
         self.language_combo.addItems(['auto', 'ko', 'en'])
+        self.channel_combo = QComboBox()
+        self.channel_combo.addItems(['stable', 'canary'])
 
         self.server_url_label = QLabel('')
         self.language_label = QLabel('')
+        self.channel_label = QLabel('')
 
         form.addRow(self.server_url_label, self.server_url_input)
         form.addRow(self.language_label, self.language_combo)
+        form.addRow(self.channel_label, self.channel_combo)
         form.addRow('', self.auto_startup_check)
         form.addRow('', self.tray_check)
         card_layout.addLayout(form)
@@ -99,6 +103,7 @@ class SettingsDialog(QDialog):
         startup_enabled: bool,
         minimize_to_tray: bool,
         language_preference: str = 'auto',
+        update_channel: str = 'stable',
     ) -> None:
         self.server_url_input.setText(server_url)
         self.auto_startup_check.setChecked(startup_enabled)
@@ -107,6 +112,10 @@ class SettingsDialog(QDialog):
         if idx < 0:
             idx = self.language_combo.findData('auto')
         self.language_combo.setCurrentIndex(idx)
+        channel_idx = self.channel_combo.findData((update_channel or 'stable').lower())
+        if channel_idx < 0:
+            channel_idx = self.channel_combo.findData('stable')
+        self.channel_combo.setCurrentIndex(channel_idx)
         self.status_label.setText('')
 
     def _emit_save(self) -> None:
@@ -120,6 +129,7 @@ class SettingsDialog(QDialog):
             self.auto_startup_check.isChecked(),
             self.tray_check.isChecked(),
             str(self.language_combo.currentData() or 'auto'),
+            str(self.channel_combo.currentData() or 'stable'),
         )
 
     def retranslate_ui(self) -> None:
@@ -133,6 +143,7 @@ class SettingsDialog(QDialog):
         )
         self.server_url_label.setText(t('settings.server_url', 'Server URL'))
         self.language_label.setText(t('settings.language_label', 'Display Language'))
+        self.channel_label.setText(t('settings.update_channel_label', 'Update Channel'))
         self.server_url_input.setPlaceholderText('http://127.0.0.1:5000')
         self.auto_startup_check.setText(t('settings.run_on_startup', 'Run on Windows startup'))
         self.tray_check.setText(t('settings.minimize_to_tray', 'Minimize to tray on close'))
@@ -152,3 +163,14 @@ class SettingsDialog(QDialog):
             idx = self.language_combo.findData('auto')
         self.language_combo.setCurrentIndex(idx)
         self.language_combo.blockSignals(False)
+
+        current_channel = str(self.channel_combo.currentData() or 'stable')
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
+        self.channel_combo.addItem(t('settings.channel.stable', 'Stable'), 'stable')
+        self.channel_combo.addItem(t('settings.channel.canary', 'Canary'), 'canary')
+        channel_idx = self.channel_combo.findData(current_channel)
+        if channel_idx < 0:
+            channel_idx = self.channel_combo.findData('stable')
+        self.channel_combo.setCurrentIndex(channel_idx)
+        self.channel_combo.blockSignals(False)

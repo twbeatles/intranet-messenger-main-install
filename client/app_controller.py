@@ -6,12 +6,15 @@ Desktop messenger application controller.
 from __future__ import annotations
 
 import mimetypes
+import re
 import socket
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, QSettings, QTimer
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
 
 from client.i18n import i18n_manager, t
 from client.services.api_client import APIClient
@@ -73,6 +76,21 @@ class MessengerAppController(QObject):
         self._rooms_reload_timer.setSingleShot(True)
         self._rooms_reload_timer.setInterval(250)
         self._rooms_reload_timer.timeout.connect(self._load_rooms)
+        self._typing_debounce_timer = QTimer(self)
+        self._typing_debounce_timer.setSingleShot(True)
+        self._typing_debounce_timer.setInterval(500)
+        self._typing_debounce_timer.timeout.connect(self._flush_typing_state)
+        self._typing_pending: bool | None = None
+        self._typing_sent = False
+        self._typing_room_id: int | None = None
+
+        self._pending_sends: dict[str, dict[str, Any]] = {}
+        self._failed_send_ids: list[str] = []
+        self._send_timeout_seconds = 4.0
+        self._send_retry_limit = 2
+        self._pending_send_timer = QTimer(self)
+        self._pending_send_timer.setInterval(1000)
+        self._pending_send_timer.timeout.connect(self._process_pending_sends)
 
         self._bind_events()
         self.i18n.subscribe(self._on_language_changed)
@@ -104,10 +122,17 @@ class MessengerAppController(QObject):
         self.main_window.logout_requested.connect(self._logout)
         self.main_window.search_requested.connect(self._on_search_requested)
         self.main_window.open_settings_requested.connect(self._open_settings)
+        self.main_window.create_room_requested.connect(self._create_room)
+        self.main_window.invite_members_requested.connect(self._invite_members)
+        self.main_window.rename_room_requested.connect(self._rename_room)
+        self.main_window.leave_room_requested.connect(self._leave_room)
+        self.main_window.edit_profile_requested.connect(self._edit_profile)
         self.main_window.open_polls_requested.connect(self._open_polls)
         self.main_window.open_files_requested.connect(self._open_files)
         self.main_window.open_admin_requested.connect(self._open_admin)
         self.main_window.load_older_messages_requested.connect(self._load_older_messages)
+        self.main_window.typing_changed.connect(self._on_typing_changed)
+        self.main_window.retry_send_requested.connect(self._retry_failed_sends)
         self.main_window.close_to_tray_requested.connect(
             lambda: self.tray.notify(t('app.name', 'Intranet Messenger'), t('tray.running', 'Running in tray.'))
         )
@@ -284,6 +309,7 @@ class MessengerAppController(QObject):
 
         self._load_rooms()
         self._check_update_policy()
+        self._pending_send_timer.start()
         self.tray.notify(t('app.name', 'Intranet Messenger'), t('tray.signed_in', 'Signed in successfully.'))
 
     def _show_main_window(self) -> None:
@@ -307,6 +333,14 @@ class MessengerAppController(QObject):
         self._rooms_reload_timer.start()
 
     def _on_room_selected(self, room_id: int) -> None:
+        if self._typing_sent and self._typing_room_id:
+            try:
+                self.socket.send_typing(int(self._typing_room_id), False)
+            except Exception:
+                pass
+        self._typing_sent = False
+        self._typing_pending = None
+        self._typing_room_id = int(room_id)
         self.current_room_id = room_id
         room = next((r for r in self.rooms_cache if int(r.get('id', 0)) == room_id), None)
         self.main_window.set_room_title(
@@ -401,14 +435,25 @@ class MessengerAppController(QObject):
                 self.main_window.show_error(t('controller.message_encryption_failed', 'Message encryption failed.'))
                 return
 
-        self.socket.send_message(
-            {
-                'room_id': int(self.current_room_id),
-                'content': content,
-                'type': 'text',
-                'encrypted': encrypted,
-            }
-        )
+        client_msg_id = uuid.uuid4().hex
+        payload = {
+            'room_id': int(self.current_room_id),
+            'content': content,
+            'type': 'text',
+            'encrypted': encrypted,
+            'client_msg_id': client_msg_id,
+        }
+        self._pending_sends[client_msg_id] = {
+            'payload': payload,
+            'created_at': time.monotonic(),
+            'last_attempt_at': 0.0,
+            'retry_count': 0,
+            'failed': False,
+        }
+        self._dispatch_pending_send(client_msg_id)
+        self._refresh_delivery_state()
+        self._typing_pending = False
+        self._typing_debounce_timer.start(120)
 
     def _on_send_file_requested(self, local_path: str) -> None:
         if not self.current_room_id:
@@ -438,7 +483,120 @@ class MessengerAppController(QObject):
         except Exception as exc:
             self.main_window.show_error(str(exc))
 
+    def _dispatch_pending_send(self, client_msg_id: str) -> None:
+        entry = self._pending_sends.get(client_msg_id)
+        if not entry:
+            return
+        entry['last_attempt_at'] = time.monotonic()
+        entry['failed'] = False
+        payload = dict(entry.get('payload') or {})
+
+        def _ack_callback(raw_ack: dict[str, Any] | Any) -> None:
+            ack = raw_ack if isinstance(raw_ack, dict) else {}
+            self._handle_send_ack(client_msg_id, ack)
+
+        self.socket.send_message(payload, ack_callback=_ack_callback)
+
+    def _handle_send_ack(self, client_msg_id: str, ack: dict[str, Any]) -> None:
+        entry = self._pending_sends.get(client_msg_id)
+        if not entry:
+            return
+        if bool(ack.get('ok')):
+            self._pending_sends.pop(client_msg_id, None)
+            if client_msg_id in self._failed_send_ids:
+                self._failed_send_ids.remove(client_msg_id)
+            self._refresh_delivery_state()
+            return
+
+        # 서버가 즉시 실패를 반환한 경우 재시도 없이 실패 처리
+        entry['failed'] = True
+        if client_msg_id not in self._failed_send_ids:
+            self._failed_send_ids.append(client_msg_id)
+        error_message = str(ack.get('error') or '').strip()
+        if error_message:
+            self.main_window.show_error(error_message)
+        self._refresh_delivery_state()
+
+    def _process_pending_sends(self) -> None:
+        now = time.monotonic()
+        changed = False
+        for client_msg_id, entry in list(self._pending_sends.items()):
+            if entry.get('failed'):
+                continue
+            last_attempt = float(entry.get('last_attempt_at') or 0.0)
+            if last_attempt <= 0:
+                continue
+            if now - last_attempt < self._send_timeout_seconds:
+                continue
+
+            retries = int(entry.get('retry_count') or 0)
+            if retries >= self._send_retry_limit:
+                entry['failed'] = True
+                if client_msg_id not in self._failed_send_ids:
+                    self._failed_send_ids.append(client_msg_id)
+                changed = True
+                continue
+
+            entry['retry_count'] = retries + 1
+            self._dispatch_pending_send(client_msg_id)
+            changed = True
+
+        if changed:
+            self._refresh_delivery_state()
+
+    def _retry_failed_sends(self) -> None:
+        pending_retry = [msg_id for msg_id in self._failed_send_ids if msg_id in self._pending_sends]
+        self._failed_send_ids = []
+        for client_msg_id in pending_retry:
+            entry = self._pending_sends.get(client_msg_id)
+            if not entry:
+                continue
+            entry['failed'] = False
+            entry['retry_count'] = 0
+            self._dispatch_pending_send(client_msg_id)
+        self._refresh_delivery_state()
+
+    def _refresh_delivery_state(self) -> None:
+        pending_count = len([1 for entry in self._pending_sends.values() if not entry.get('failed')])
+        failed_count = len(self._failed_send_ids)
+        if failed_count > 0:
+            self.main_window.set_delivery_state('failed', failed_count)
+            return
+        if pending_count > 0:
+            self.main_window.set_delivery_state('pending', pending_count)
+            return
+        self.main_window.set_delivery_state('idle', 0)
+
+    def _on_typing_changed(self, is_typing: bool) -> None:
+        if not self.current_room_id:
+            return
+        self._typing_pending = bool(is_typing)
+        self._typing_debounce_timer.start(500 if is_typing else 150)
+
+    def _flush_typing_state(self) -> None:
+        if self._typing_pending is None:
+            return
+        room_id = int(self.current_room_id or 0)
+        if room_id <= 0:
+            return
+        next_state = bool(self._typing_pending)
+        if next_state == self._typing_sent and self._typing_room_id == room_id:
+            return
+        try:
+            self.socket.send_typing(room_id, next_state)
+            self._typing_sent = next_state
+            self._typing_room_id = room_id
+        except Exception:
+            pass
+
     def _on_socket_new_message(self, message: dict[str, Any]) -> None:
+        client_msg_id = str(message.get('client_msg_id') or '').strip()
+        if client_msg_id:
+            self._pending_sends.pop(client_msg_id, None)
+            if client_msg_id in self._failed_send_ids:
+                self._failed_send_ids.remove(client_msg_id)
+            self._refresh_delivery_state()
+
         room_id = int(message.get('room_id') or 0)
         sender_id = int(message.get('sender_id') or 0)
         current_user_id = int((self.current_user or {}).get('id') or 0)
@@ -643,12 +801,241 @@ class MessengerAppController(QObject):
             return None
         return int(self.current_room_id)
 
+    @staticmethod
+    def _parse_user_ids(raw: str) -> list[int]:
+        parsed: list[int] = []
+        seen: set[int] = set()
+        tokens = re.split(r'[\s,]+', raw.strip())
+        for token in tokens:
+            if not token:
+                continue
+            try:
+                user_id = int(token)
+            except ValueError:
+                continue
+            if user_id > 0 and user_id not in seen:
+                seen.add(user_id)
+                parsed.append(user_id)
+        return parsed
+
+    def _prompt_user_ids(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        title: str,
+        label: str,
+        excluded_ids: set[int] | None = None,
+    ) -> list[int] | None:
+        excluded_ids = excluded_ids or set()
+        selectable = []
+        for user in candidates:
+            try:
+                user_id = int(user.get('id') or 0)
+            except Exception:
+                user_id = 0
+            if user_id <= 0 or user_id in excluded_ids:
+                continue
+            nickname = str(user.get('nickname') or user.get('username') or user_id)
+            username = str(user.get('username') or '')
+            if username and username != nickname:
+                selectable.append(f"{user_id}: {nickname} (@{username})")
+            else:
+                selectable.append(f"{user_id}: {nickname}")
+
+        if not selectable:
+            self.main_window.show_info(t('controller.no_selectable_users', 'No selectable users found.'))
+            return None
+
+        preview = '\n'.join(selectable[:30])
+        if len(selectable) > 30:
+            preview += '\n...'
+        prompt = (
+            f"{label}\n\n"
+            f"{t('controller.user_picker_help', 'Enter IDs separated by comma or whitespace.')}\n\n"
+            f"{preview}"
+        )
+        raw_text, ok = QInputDialog.getMultiLineText(self.main_window, title, prompt)
+        if not ok:
+            return None
+        user_ids = self._parse_user_ids(raw_text)
+        if not user_ids:
+            self.main_window.show_info(t('controller.user_picker_empty', 'No valid user IDs were entered.'))
+            return None
+        return user_ids
+
+    def _create_room(self) -> None:
+        try:
+            users = self.api.get_users()
+            selected_user_ids = self._prompt_user_ids(
+                users,
+                title=t('main.new_room', 'New Room'),
+                label=t('controller.select_members_for_room', 'Select users to create a new conversation.'),
+            )
+            if selected_user_ids is None:
+                return
+
+            room_name, ok = QInputDialog.getText(
+                self.main_window,
+                t('main.new_room', 'New Room'),
+                t('controller.room_name_optional', 'Room name (optional)'),
+            )
+            if not ok:
+                return
+
+            created = self.api.create_room(selected_user_ids, room_name.strip())
+            room_id = int(created.get('room_id') or 0)
+            self._load_rooms()
+            if room_id > 0:
+                self.main_window.select_room(room_id)
+        except Exception as exc:
+            self.main_window.show_error(str(exc))
+
+    def _invite_members(self) -> None:
+        room_id = self._require_room()
+        if not room_id:
+            return
+        try:
+            all_users = self.api.get_users()
+            room_info = self.api.get_room_info(room_id)
+            current_member_ids = {
+                int(member.get('id') or 0)
+                for member in (room_info.get('members') or [])
+                if int(member.get('id') or 0) > 0
+            }
+            selected_user_ids = self._prompt_user_ids(
+                all_users,
+                title=t('main.invite_members', 'Invite Members'),
+                label=t('controller.select_members_to_invite', 'Select users to invite to this room.'),
+                excluded_ids=current_member_ids,
+            )
+            if selected_user_ids is None:
+                return
+            result = self.api.invite_room_members(room_id, selected_user_ids)
+            added = int(result.get('added_count') or 0)
+            self.main_window.show_info(
+                t('controller.members_invited', '{count} members invited.', count=added)
+            )
+            self._reload_current_room_messages(refresh_admins=True)
+            self._schedule_rooms_reload(120)
+        except Exception as exc:
+            self.main_window.show_error(str(exc))
+
+    def _leave_room(self) -> None:
+        room_id = self._require_room()
+        if not room_id:
+            return
+        confirmed = QMessageBox.question(
+            self.main_window,
+            t('main.leave_room', 'Leave Room'),
+            t('controller.leave_room_confirm', 'Do you want to leave this room?'),
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.api.leave_room(room_id)
+            self.current_room_id = None
+            self.current_room_key = ''
+            self.current_room_members = []
+            self.current_admin_ids = set()
+            self.current_is_admin = False
+            self._typing_pending = False
+            self._typing_sent = False
+            self._typing_room_id = None
+            self.main_window.clear_room_selection()
+            self._load_rooms()
+        except Exception as exc:
+            self.main_window.show_error(str(exc))
+
+    def _rename_room(self) -> None:
+        room_id = self._require_room()
+        if not room_id:
+            return
+        try:
+            if not self.api.is_room_admin(room_id):
+                self.main_window.show_error(t('controller.admin_required', 'Administrator privilege is required.'))
+                return
+            current_name = next(
+                (
+                    str(room.get('name') or '')
+                    for room in self.rooms_cache
+                    if int(room.get('id') or 0) == room_id
+                ),
+                '',
+            )
+            new_name, ok = QInputDialog.getText(
+                self.main_window,
+                t('main.rename_room', 'Rename Room'),
+                t('controller.new_room_name', 'New room name'),
+                text=current_name,
+            )
+            if not ok:
+                return
+            normalized = new_name.strip()
+            if not normalized:
+                self.main_window.show_info(t('controller.room_name_required', 'Room name is required.'))
+                return
+            self.api.update_room_name(room_id, normalized)
+            self._update_room_cache_name(room_id, normalized)
+            self.main_window.set_room_title(normalized)
+            self.main_window.set_rooms(self.rooms_cache)
+        except Exception as exc:
+            self.main_window.show_error(str(exc))
+
+    def _edit_profile(self) -> None:
+        try:
+            profile = self.api.get_profile()
+            nickname_default = str(
+                profile.get('nickname')
+                or (self.current_user or {}).get('nickname')
+                or (self.current_user or {}).get('username')
+                or ''
+            )
+            status_default = str(profile.get('status_message') or '')
+            nickname, ok = QInputDialog.getText(
+                self.main_window,
+                t('main.edit_profile', 'Edit Profile'),
+                t('controller.profile_nickname', 'Nickname'),
+                text=nickname_default,
+            )
+            if not ok:
+                return
+            normalized_nickname = nickname.strip()
+            if not normalized_nickname:
+                self.main_window.show_info(t('controller.nickname_required', 'Nickname is required.'))
+                return
+
+            status, ok = QInputDialog.getText(
+                self.main_window,
+                t('main.edit_profile', 'Edit Profile'),
+                t('controller.profile_status_message', 'Status message'),
+                text=status_default,
+            )
+            if not ok:
+                return
+
+            self.api.update_profile(normalized_nickname, status.strip())
+            if self.current_user is None:
+                self.current_user = {}
+            self.current_user['nickname'] = normalized_nickname
+            self.current_user['status_message'] = status.strip()
+            self.main_window.set_user(self.current_user)
+            self.socket.emit(
+                'profile_updated',
+                {
+                    'nickname': normalized_nickname,
+                    'profile_image': self.current_user.get('profile_image', ''),
+                },
+            )
+        except Exception as exc:
+            self.main_window.show_error(str(exc))
+
     def _open_settings(self) -> None:
         self.settings_dialog.set_values(
             server_url=self.preferred_server_url,
             startup_enabled=self.startup_manager.is_enabled(),
             minimize_to_tray=self.main_window.minimize_to_tray,
             language_preference=self.i18n.preference,
+            update_channel=self._settings.value('updates/channel', 'stable', type=str),
         )
         self.settings_dialog.show()
         self.settings_dialog.activateWindow()
@@ -660,6 +1047,7 @@ class MessengerAppController(QObject):
         startup_enabled: bool,
         minimize_to_tray: bool,
         language_preference: str,
+        update_channel: str,
     ) -> None:
         try:
             self.startup_manager.set_enabled(startup_enabled)
@@ -686,6 +1074,10 @@ class MessengerAppController(QObject):
                     )
                 )
         self.i18n.set_preference(language_preference or 'auto')
+        normalized_channel = (update_channel or 'stable').strip().lower()
+        if normalized_channel not in ('stable', 'canary'):
+            normalized_channel = 'stable'
+        self._settings.setValue('updates/channel', normalized_channel)
         self.settings_dialog.hide()
         self.main_window.show_info(t('settings.saved', 'Settings saved.'))
 
@@ -860,6 +1252,8 @@ class MessengerAppController(QObject):
 
     def _logout(self) -> None:
         self._rooms_reload_timer.stop()
+        self._typing_debounce_timer.stop()
+        self._pending_send_timer.stop()
         try:
             self.socket.disconnect()
         except Exception:
@@ -876,6 +1270,12 @@ class MessengerAppController(QObject):
         self.current_room_members = []
         self.current_admin_ids = set()
         self.current_is_admin = False
+        self._typing_pending = None
+        self._typing_sent = False
+        self._typing_room_id = None
+        self._pending_sends.clear()
+        self._failed_send_ids.clear()
+        self.main_window.set_delivery_state('idle', 0)
         self.main_window.hide()
         self.polls_dialog.hide()
         self.files_dialog.hide()
@@ -886,6 +1286,8 @@ class MessengerAppController(QObject):
         self.tray.notify(t('app.name', 'Intranet Messenger'), t('tray.signed_out', 'Signed out.'))
 
     def _quit(self) -> None:
+        self._typing_debounce_timer.stop()
+        self._pending_send_timer.stop()
         try:
             self.socket.disconnect()
         except Exception:

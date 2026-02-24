@@ -139,7 +139,8 @@ class SessionStore:
                 raw = keyring.get_password(APP_SERVICE_NAME, APP_ACCOUNT_NAME) or ''
             except Exception:
                 raw = ''
-        elif os.path.exists(self._fallback_path):
+
+        if not raw and os.path.exists(self._fallback_path):
             with open(self._fallback_path, 'r', encoding='utf-8') as fp:
                 raw = fp.read()
 
@@ -159,7 +160,6 @@ class SessionStore:
                 keyring.delete_password(APP_SERVICE_NAME, APP_ACCOUNT_NAME)
             except Exception:
                 pass
-            return
 
         if os.path.exists(self._fallback_path):
             try:

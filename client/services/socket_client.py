@@ -11,6 +11,7 @@ import socketio
 
 
 EventCallback = Callable[[dict[str, Any]], None]
+AckCallback = Callable[[dict[str, Any]], None]
 
 
 class SocketClient:
@@ -118,8 +119,18 @@ class SocketClient:
     def subscribe_rooms(self, room_ids: list[int]) -> None:
         self.emit('subscribe_rooms', {'room_ids': room_ids})
 
-    def send_message(self, payload: dict[str, Any]) -> None:
-        self.emit('send_message', payload)
+    def send_message(self, payload: dict[str, Any], ack_callback: AckCallback | None = None) -> None:
+        if ack_callback is None:
+            self.emit('send_message', payload)
+            return
+
+        def _callback(*args: Any) -> None:
+            if args and isinstance(args[0], dict):
+                ack_callback(args[0])
+                return
+            ack_callback({})
+
+        self._client.emit('send_message', payload, callback=_callback)
 
     def send_read(self, room_id: int, message_id: int) -> None:
         self.emit('message_read', {'room_id': room_id, 'message_id': message_id})

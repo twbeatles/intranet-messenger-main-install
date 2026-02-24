@@ -47,6 +47,11 @@ class _ComposerTextEdit(QTextEdit):
 class MainWindow(QMainWindow):
     room_selected = Signal(int)
     refresh_rooms_requested = Signal()
+    create_room_requested = Signal()
+    invite_members_requested = Signal()
+    rename_room_requested = Signal()
+    leave_room_requested = Signal()
+    edit_profile_requested = Signal()
     send_message_requested = Signal(str)
     logout_requested = Signal()
     search_requested = Signal(str)
@@ -58,6 +63,8 @@ class MainWindow(QMainWindow):
     open_admin_requested = Signal()
     send_file_requested = Signal(str)  # local path
     load_older_messages_requested = Signal(int)  # before message id
+    typing_changed = Signal(bool)
+    retry_send_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -75,6 +82,8 @@ class MainWindow(QMainWindow):
         self._history_loading = False
         self._history_scroll_blocked = False
         self._history_banner_key = '__history_banner__'
+        self._delivery_state = 'idle'
+        self._delivery_count = 0
         self._build_ui()
         i18n_manager.subscribe(self.retranslate_ui)
         self.retranslate_ui()
@@ -110,9 +119,11 @@ class MainWindow(QMainWindow):
         self.settings_btn = QPushButton('⚙️')
         self.settings_btn.setFixedSize(36, 36)
         self.settings_btn.setStyleSheet("border-radius: 18px; border: none; background: #e2e8f0; font-size: 14pt;")
+        self.profile_btn = QPushButton('')
         
         user_header.addLayout(user_info)
         user_header.addStretch()
+        user_header.addWidget(self.profile_btn)
         user_header.addWidget(self.settings_btn)
 
         inbox_title = QLabel('')
@@ -131,9 +142,11 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.rooms_list)
 
         left_actions = QHBoxLayout()
+        self.new_room_btn = QPushButton('')
         self.refresh_btn = QPushButton('')
         self.logout_btn = QPushButton('')
         self.logout_btn.setProperty('variant', 'danger')
+        left_actions.addWidget(self.new_room_btn)
         left_actions.addWidget(self.refresh_btn)
         left_actions.addStretch()
         left_actions.addWidget(self.logout_btn)
@@ -161,6 +174,10 @@ class MainWindow(QMainWindow):
         self.polls_btn = QPushButton('')
         self.files_btn = QPushButton('')
         self.admin_btn = QPushButton('')
+        self.invite_btn = QPushButton('')
+        self.rename_btn = QPushButton('')
+        self.leave_btn = QPushButton('')
+        self.leave_btn.setProperty('variant', 'danger')
         self.polls_btn.setProperty('variant', 'primary')
 
         header_titles = QVBoxLayout()
@@ -169,6 +186,9 @@ class MainWindow(QMainWindow):
         header_titles.addWidget(self.room_meta)
         room_header_layout.addLayout(header_titles)
         room_header_layout.addStretch()
+        room_header_layout.addWidget(self.invite_btn)
+        room_header_layout.addWidget(self.rename_btn)
+        room_header_layout.addWidget(self.leave_btn)
         room_header_layout.addWidget(self.polls_btn)
         room_header_layout.addWidget(self.files_btn)
         room_header_layout.addWidget(self.admin_btn)
@@ -195,6 +215,13 @@ class MainWindow(QMainWindow):
         self.compose_hint_label = QLabel('')
         self.compose_hint_label.setProperty('muted', True)
         compose_meta.addWidget(self.compose_hint_label)
+        self.delivery_state_label = QLabel('')
+        self.delivery_state_label.setProperty('muted', True)
+        self.retry_send_btn = QPushButton('')
+        self.retry_send_btn.setVisible(False)
+        self.retry_send_btn.setProperty('variant', 'danger')
+        compose_meta.addWidget(self.delivery_state_label)
+        compose_meta.addWidget(self.retry_send_btn)
         compose_meta.addStretch()
 
         self.attach_btn = QPushButton('')
@@ -215,18 +242,24 @@ class MainWindow(QMainWindow):
         splitter.setSizes([330, 930])
         layout.addWidget(splitter)
 
+        self.profile_btn.clicked.connect(self.edit_profile_requested.emit)
         self.refresh_btn.clicked.connect(self.refresh_rooms_requested.emit)
+        self.new_room_btn.clicked.connect(self.create_room_requested.emit)
         self.logout_btn.clicked.connect(self.logout_requested.emit)
         self.settings_btn.clicked.connect(self.open_settings_requested.emit)
+        self.invite_btn.clicked.connect(self.invite_members_requested.emit)
+        self.rename_btn.clicked.connect(self.rename_room_requested.emit)
+        self.leave_btn.clicked.connect(self.leave_room_requested.emit)
         self.polls_btn.clicked.connect(self.open_polls_requested.emit)
         self.files_btn.clicked.connect(self.open_files_requested.emit)
         self.admin_btn.clicked.connect(self.open_admin_requested.emit)
+        self.retry_send_btn.clicked.connect(self.retry_send_requested.emit)
         self.send_btn.clicked.connect(self._emit_send_message)
         self.attach_btn.clicked.connect(self._select_file)
         self.rooms_list.currentRowChanged.connect(self._on_room_row_changed)
         self.search_input.textChanged.connect(self.search_requested.emit)
         self.message_input.send_shortcut_triggered.connect(self._emit_send_message)
-        self.message_input.textChanged.connect(self._update_compose_hint)
+        self.message_input.textChanged.connect(self._on_message_text_changed)
         self._set_room_actions_enabled(False)
 
     def set_user(self, user: dict[str, Any]) -> None:
@@ -240,6 +273,18 @@ class MainWindow(QMainWindow):
 
     def set_connected(self, connected: bool) -> None:
         self._set_connection_style(connected)
+
+    def select_room(self, room_id: int) -> None:
+        for row, mapped_id in self._room_id_by_row.items():
+            if int(mapped_id) == int(room_id):
+                self.rooms_list.setCurrentRow(row)
+                return
+
+    def clear_room_selection(self) -> None:
+        self.rooms_list.setCurrentRow(-1)
+        self.set_messages([], has_more=False)
+        self.set_room_title(t('main.select_room', 'Select a room'))
+        self._set_room_actions_enabled(False)
 
     def set_rooms(self, rooms: list[dict[str, Any]]) -> None:
         current_room_id = self._room_id_by_row.get(self.rooms_list.currentRow())
@@ -366,6 +411,34 @@ class MainWindow(QMainWindow):
         self.message_input.clear()
         self._update_compose_hint()
 
+    def _on_message_text_changed(self) -> None:
+        self._update_compose_hint()
+        self.typing_changed.emit(bool(self.message_input.toPlainText().strip()))
+
+    def set_delivery_state(self, state: str, count: int = 0) -> None:
+        self._delivery_state = state
+        self._delivery_count = max(0, int(count))
+
+        if state == 'pending' and self._delivery_count > 0:
+            self.delivery_state_label.setText(
+                t('main.delivery_pending', 'Sending... ({count})', count=self._delivery_count)
+            )
+            self.delivery_state_label.setStyleSheet('color:#7c2d12; background:#ffedd5; border-radius:8px; padding:2px 8px;')
+            self.retry_send_btn.setVisible(False)
+            return
+
+        if state == 'failed' and self._delivery_count > 0:
+            self.delivery_state_label.setText(
+                t('main.delivery_failed', 'Failed to send ({count})', count=self._delivery_count)
+            )
+            self.delivery_state_label.setStyleSheet('color:#7f1d1d; background:#fee2e2; border-radius:8px; padding:2px 8px;')
+            self.retry_send_btn.setVisible(True)
+            return
+
+        self.delivery_state_label.setText('')
+        self.delivery_state_label.setStyleSheet('')
+        self.retry_send_btn.setVisible(False)
+
     def _select_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, t('main.select_file', 'Select file'))
         if path:
@@ -405,6 +478,9 @@ class MainWindow(QMainWindow):
         self.polls_btn.setEnabled(enabled)
         self.files_btn.setEnabled(enabled)
         self.admin_btn.setEnabled(enabled)
+        self.invite_btn.setEnabled(enabled)
+        self.rename_btn.setEnabled(enabled)
+        self.leave_btn.setEnabled(enabled)
         self.message_input.setEnabled(enabled)
         self.attach_btn.setEnabled(enabled)
         self.send_btn.setEnabled(enabled)
@@ -676,15 +752,21 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(t('app.desktop_title', 'Intranet Messenger Desktop'))
         self._inbox_title_label.setText(t('main.conversations', 'Conversations'))
         self.search_input.setPlaceholderText(t('main.search_placeholder', 'Search rooms or previews'))
+        self.profile_btn.setText(t('main.profile', 'Profile'))
+        self.new_room_btn.setText(t('main.new_room', 'New Room'))
         self.refresh_btn.setText(t('main.refresh', 'Refresh'))
         self.settings_btn.setText(t('main.settings', 'Settings'))
         self.logout_btn.setText(t('main.logout', 'Logout'))
+        self.invite_btn.setText(t('main.invite_members', 'Invite'))
+        self.rename_btn.setText(t('main.rename_room', 'Rename'))
+        self.leave_btn.setText(t('main.leave_room', 'Leave'))
         self.polls_btn.setText(t('main.polls', 'Polls'))
         self.files_btn.setText(t('main.files', 'Files'))
         self.admin_btn.setText(t('main.admin', 'Admin'))
         self.message_input.setPlaceholderText(t('main.compose_placeholder', 'Write a message... (Ctrl+Enter to send)'))
         self.attach_btn.setText(t('main.attach', 'Attach'))
         self.send_btn.setText(t('main.send', 'Send'))
+        self.retry_send_btn.setText(t('main.retry_send', 'Retry'))
         if not self.message_input.isEnabled():
             self._current_room_name = t('main.select_room', 'Select a room')
             self.room_title.setText(self._current_room_name)
@@ -693,6 +775,7 @@ class MainWindow(QMainWindow):
             self._update_room_meta_label()
         self._set_connection_style(self._connected)
         self._update_compose_hint()
+        self.set_delivery_state(self._delivery_state, self._delivery_count)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.minimize_to_tray:

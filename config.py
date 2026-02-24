@@ -41,7 +41,15 @@ TEMPLATE_FOLDER = os.path.join(BUNDLE_DIR, 'templates')
 # ============================================================================
 # 서버 설정
 # ============================================================================
-USE_HTTPS = False
+APP_ENV = (os.environ.get('MESSENGER_ENV') or os.environ.get('FLASK_ENV') or 'dev').strip().lower()
+_USE_HTTPS_ENV = (os.environ.get('USE_HTTPS') or '').strip().lower()
+if _USE_HTTPS_ENV in ('1', 'true', 'yes', 'on'):
+    USE_HTTPS = True
+elif _USE_HTTPS_ENV in ('0', 'false', 'no', 'off'):
+    USE_HTTPS = False
+else:
+    USE_HTTPS = APP_ENV in ('prod', 'production')
+
 DEFAULT_PORT = 5000
 CONTROL_PORT = 5001  # GUI-서버 제어 API 포트
 SESSION_TIMEOUT_HOURS = 72  # 3일

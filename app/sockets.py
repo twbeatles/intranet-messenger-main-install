@@ -119,43 +119,45 @@ def register_socket_events(socketio):
     
     @socketio.on('connect')
     def handle_connect():
-        if 'user_id' in session:
-            user_id = session['user_id']
-            current_token = get_user_session_token(user_id)
-            if current_token and session.get('session_token') != current_token:
-                return False
-            
-            with online_users_lock:
-                online_users[request.sid] = user_id
-                if user_id not in user_sids:
-                    user_sids[user_id] = []
-                user_sids[user_id].append(request.sid)
-                was_offline = len(user_sids[user_id]) == 1
-            
-            # Join all my rooms so this client receives room events without polling.
-            room_ids = get_user_room_ids(user_id)
-            for room_id in room_ids:
-                try:
-                    join_room(f'room_{room_id}')
-                except Exception:
-                    pass
+        if 'user_id' not in session:
+            return False
 
-            # 첫 연결일 때만 상태 업데이트
-            if was_offline:
-                update_user_status(user_id, 'online')
-                # 해당 사용자의 방에만 상태 전송 (broadcast 대신)
-                for room_id in room_ids:
-                    emit('user_status', {'user_id': user_id, 'status': 'online'}, 
-                         room=f'room_{room_id}')
-            
-            with stats_lock:
-                server_stats['total_connections'] += 1
-                server_stats['active_connections'] += 1
-                # [v4.22] 100개 연결마다 캐시 정리 (메모리 누수 방지)
-                should_cleanup = server_stats['total_connections'] % 100 == 0
-            
-            if should_cleanup:
-                cleanup_old_cache()
+        user_id = session['user_id']
+        current_token = get_user_session_token(user_id)
+        if current_token and session.get('session_token') != current_token:
+            return False
+
+        with online_users_lock:
+            online_users[request.sid] = user_id
+            if user_id not in user_sids:
+                user_sids[user_id] = []
+            user_sids[user_id].append(request.sid)
+            was_offline = len(user_sids[user_id]) == 1
+
+        # Join all my rooms so this client receives room events without polling.
+        room_ids = get_user_room_ids(user_id)
+        for room_id in room_ids:
+            try:
+                join_room(f'room_{room_id}')
+            except Exception:
+                pass
+
+        # 첫 연결일 때만 상태 업데이트
+        if was_offline:
+            update_user_status(user_id, 'online')
+            # 해당 사용자의 방에만 상태 전송 (broadcast 대신)
+            for room_id in room_ids:
+                emit('user_status', {'user_id': user_id, 'status': 'online'},
+                     room=f'room_{room_id}')
+
+        with stats_lock:
+            server_stats['total_connections'] += 1
+            server_stats['active_connections'] += 1
+            # [v4.22] 100개 연결마다 캐시 정리 (메모리 누수 방지)
+            should_cleanup = server_stats['total_connections'] % 100 == 0
+
+        if should_cleanup:
+            cleanup_old_cache()
     
     @socketio.on('disconnect')
     def handle_disconnect():
@@ -262,13 +264,14 @@ def register_socket_events(socketio):
     def handle_send_message(data):
         try:
             if 'user_id' not in session:
-                return
+                _emit_error_i18n('로그인이 필요합니다.')
+                return {'ok': False, 'error': '로그인이 필요합니다.'}
             
             # [v4.2] 입력 유효성 검사 강화
             room_id = data.get('room_id')
             if not isinstance(room_id, int) or room_id <= 0:
                 _emit_error_i18n('잘못된 대화방 ID입니다.')
-                return
+                return {'ok': False, 'error': '잘못된 대화방 ID입니다.'}
             
             content = data.get('content', '')
             if isinstance(content, str):
@@ -288,26 +291,38 @@ def register_socket_events(socketio):
             reply_to = data.get('reply_to')
             if reply_to is not None and not isinstance(reply_to, int):
                 reply_to = None
+            if isinstance(reply_to, int) and reply_to <= 0:
+                reply_to = None
             encrypted = bool(data.get('encrypted', True))
+            client_msg_id = data.get('client_msg_id')
+            if not isinstance(client_msg_id, str):
+                client_msg_id = ''
+            client_msg_id = client_msg_id.strip()[:64]
 
             if message_type in ('text', 'system'):
                 if encrypted:
                     # Do not truncate ciphertext; reject only extreme payload size.
                     if len(content) > 200000:
                         _emit_error_i18n('잘못된 요청입니다.')
-                        return
+                        return {'ok': False, 'error': '잘못된 요청입니다.'}
                 else:
                     # Plaintext is bounded by policy.
                     if len(content) > 10000:
                         _emit_error_i18n('잘못된 요청입니다.')
-                        return
+                        return {'ok': False, 'error': '잘못된 요청입니다.'}
 
             # 캐시된 방 목록으로 빠른 확인
             user_rooms = get_user_room_ids(session['user_id'])
             if room_id not in user_rooms:
                 if not is_room_member(room_id, session['user_id']):
                     _emit_error_i18n('대화방 접근 권한이 없습니다.')
-                    return
+                    return {'ok': False, 'error': '대화방 접근 권한이 없습니다.'}
+
+            if reply_to is not None:
+                reply_room_id = get_message_room_id(reply_to)
+                if reply_room_id is None or int(reply_room_id) != int(room_id):
+                    _emit_error_i18n('잘못된 요청입니다.')
+                    return {'ok': False, 'error': '잘못된 요청입니다.'}
 
             if message_type in ('file', 'image'):
                 token = data.get('upload_token')
@@ -319,7 +334,7 @@ def register_socket_events(socketio):
                 )
                 if reason:
                     _emit_error_i18n(str(reason))
-                    return
+                    return {'ok': False, 'error': str(reason)}
 
                 token_data = consume_upload_token(
                     token=token,
@@ -329,7 +344,7 @@ def register_socket_events(socketio):
                 )
                 if not token_data:
                     _emit_error_i18n('업로드 토큰이 이미 사용되었거나 만료되었습니다.')
-                    return
+                    return {'ok': False, 'error': '업로드 토큰이 이미 사용되었거나 만료되었습니다.'}
 
                 file_path = token_data.get('file_path')
                 file_name = token_data.get('file_name')
@@ -338,12 +353,14 @@ def register_socket_events(socketio):
                 content = file_name or content
 
             if not content and not file_path:
-                return
+                return {'ok': False, 'error': '잘못된 요청입니다.'}
             
             message = create_message(
                 room_id, session['user_id'], content, message_type, file_path, file_name, reply_to, encrypted
             )
             if message:
+                if client_msg_id:
+                    message['client_msg_id'] = client_msg_id
                 message['unread_count'] = get_unread_count(room_id, message['id'], session['user_id'])
                 if message_type in ('file', 'image') and file_path:
                     from app.models import add_room_file
@@ -359,6 +376,7 @@ def register_socket_events(socketio):
                 emit('new_message', message, room=f'room_{room_id}')
                 # broadcast 대신 해당 방 멤버들의 모든 세션에 전송
                 logger.debug(f"Message sent: room={room_id}, user={session['user_id']}, type={message_type}")
+                return {'ok': True, 'message_id': int(message.get('id') or 0)}
             else:
                 logger.warning(f"Message creation failed: room={room_id}, user={session['user_id']}")
                 if message_type in ('file', 'image') and file_path:
@@ -366,9 +384,11 @@ def register_socket_events(socketio):
                         f"Potential orphan upload file after message failure: room={room_id}, user={session['user_id']}, path={file_path}"
                     )
                 _emit_error_i18n('메시지 저장에 실패했습니다.')
+                return {'ok': False, 'error': '메시지 저장에 실패했습니다.'}
         except Exception as e:
             logger.error(f"Send message error: {e}\n{traceback.format_exc()}")
             _emit_error_i18n('메시지 전송에 실패했습니다.')
+            return {'ok': False, 'error': '메시지 전송에 실패했습니다.'}
     
     @socketio.on('message_read')
     def handle_message_read(data):
@@ -378,18 +398,31 @@ def register_socket_events(socketio):
             
             room_id = data.get('room_id')
             message_id = data.get('message_id')
-            
-            if room_id and message_id:
-                # [v4.13] 멤버십 확인
-                if not is_room_member(room_id, session['user_id']):
-                    return
-                
-                update_last_read(room_id, session['user_id'], message_id)
-                emit('read_updated', {
-                    'room_id': room_id,
-                    'user_id': session['user_id'],
-                    'message_id': message_id
-                }, room=f'room_{room_id}')
+
+            try:
+                normalized_room_id = int(room_id)
+                normalized_message_id = int(message_id)
+            except (TypeError, ValueError):
+                return
+
+            if normalized_room_id <= 0 or normalized_message_id <= 0:
+                return
+
+            # [v4.13] 멤버십 확인
+            if not is_room_member(normalized_room_id, session['user_id']):
+                return
+
+            message_room_id = get_message_room_id(normalized_message_id)
+            if message_room_id is None or int(message_room_id) != normalized_room_id:
+                _emit_error_i18n('잘못된 요청입니다.')
+                return
+
+            update_last_read(normalized_room_id, session['user_id'], normalized_message_id)
+            emit('read_updated', {
+                'room_id': normalized_room_id,
+                'user_id': session['user_id'],
+                'message_id': normalized_message_id
+            }, room=f'room_{normalized_room_id}')
         except Exception as e:
             logger.error(f"Message read error: {e}")
     

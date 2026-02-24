@@ -67,7 +67,7 @@ def create_message(room_id, sender_id, content, message_type='text',
                    rm.content as reply_content, ru.nickname as reply_sender
             FROM messages m
             JOIN users u ON m.sender_id = u.id
-            LEFT JOIN messages rm ON m.reply_to = rm.id
+            LEFT JOIN messages rm ON m.reply_to = rm.id AND rm.room_id = m.room_id
             LEFT JOIN users ru ON rm.sender_id = ru.id
             WHERE m.id = ?
         ''', (message_id,))
@@ -94,7 +94,7 @@ def get_room_messages(room_id, limit=50, before_id=None, include_reactions=True)
                        rm.content as reply_content, ru.nickname as reply_sender
                 FROM messages m
                 JOIN users u ON m.sender_id = u.id
-                LEFT JOIN messages rm ON m.reply_to = rm.id
+                LEFT JOIN messages rm ON m.reply_to = rm.id AND rm.room_id = m.room_id
                 LEFT JOIN users ru ON rm.sender_id = ru.id
                 WHERE m.room_id = ? AND m.id < ?
                 ORDER BY m.id DESC
@@ -106,7 +106,7 @@ def get_room_messages(room_id, limit=50, before_id=None, include_reactions=True)
                        rm.content as reply_content, ru.nickname as reply_sender
                 FROM messages m
                 JOIN users u ON m.sender_id = u.id
-                LEFT JOIN messages rm ON m.reply_to = rm.id
+                LEFT JOIN messages rm ON m.reply_to = rm.id AND rm.room_id = m.room_id
                 LEFT JOIN users ru ON rm.sender_id = ru.id
                 WHERE m.room_id = ?
                 ORDER BY m.id DESC
@@ -136,7 +136,12 @@ def update_last_read(room_id, user_id, message_id):
         cursor.execute('''
             UPDATE room_members SET last_read_message_id = ?
             WHERE room_id = ? AND user_id = ? AND last_read_message_id < ?
-        ''', (message_id, room_id, user_id, message_id))
+              AND EXISTS (
+                  SELECT 1
+                  FROM messages m
+                  WHERE m.id = ? AND m.room_id = ?
+              )
+        ''', (message_id, room_id, user_id, message_id, message_id, room_id))
         conn.commit()
     except Exception as e:
         logger.error(f"Update last read error: {e}")
