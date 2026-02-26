@@ -80,12 +80,16 @@
   - `channel`, `desktop_only_mode`
   - `minimum_version`, `latest_version`
   - `download_url`, `release_notes_url`
+  - optional metadata: `artifact_sha256`, `artifact_signature`, `signature_alg`
   - `update_available`, `force_update`
 
 ## Main REST APIs
 
 - Auth: `/api/register`, `/api/login`, `/api/logout`, `/api/me`
+- Enterprise auth (scaffold): `/api/auth/enterprise-login`
+- Approval workflow (scaffold): `/api/admin/users/approve`
 - Users: `/api/users`, `/api/users/online`, `/api/profile`
+- Ops health: `/api/system/health`
 - Rooms:
   - `/api/rooms` (GET/POST)
   - `/api/rooms/<room_id>/messages`
@@ -178,6 +182,7 @@
 - reject client-originated `type=system` immediately (`system` is server-internal only)
 - `reply_to` must reference a message in the same `room_id`
 - `upload_token` required for file/image messages
+- when `REQUIRE_MESSAGE_ENCRYPTION=True`, `type=text` requires `encrypted=true`
 - reject invalid room access or malformed payload
 - apply idempotency on `(room_id, sender_id, client_msg_id)` when `client_msg_id` exists
 

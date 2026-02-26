@@ -8,6 +8,7 @@
 2. run `python server.py --cli`
 3. verify:
 - `GET /api/client/update`
+- `GET /api/system/health`
 - sample login and message round-trip
 
 ## 2) Client Startup Check
@@ -41,7 +42,11 @@ Must backup:
 - `uploads/`
 - `.secret_key`
 - `.security_salt`
+- `.master_key`
 - `config.py`
+
+Backup verification script:
+- `scripts/verify_backup_requirements.ps1`
 
 Recommended frequency:
 - daily full backup + 7-day retention
@@ -64,7 +69,18 @@ Recommended frequency:
 - re-validate unauthorized `/uploads` access blocking
 - re-validate admin API authorization (`.../admins`)
 
-## 7) Recurring Maintenance
+## 7) Policy Switches (Defaults)
+
+- `ENFORCE_HTTPS=False`: HTTPS is not forced (warnings are logged when not active)
+- `ALLOW_SELF_REGISTER=True`: open self-registration allowed (can be disabled by policy)
+- `REQUIRE_MESSAGE_ENCRYPTION=False`: plaintext text allowed (rejected when enforced)
+- `SESSION_TOKEN_FAIL_OPEN=True`: fail-open when session-token DB check errors
+- `MAINTENANCE_INTERVAL_MINUTES=30`: cleanup scheduler interval
+- `RATE_LIMIT_STORAGE_URI=memory://`: in-memory rate-limit backend
+- `RATE_LIMIT_KEY_MODE=ip`: IP-based rate-limit key strategy
+- `UPLOAD_SCAN_ENABLED=False`, `UPLOAD_SCAN_PROVIDER=noop`: upload-scan scaffold disabled by default
+
+## 8) Recurring Maintenance
 
 - cleanup expired/revoked `device_sessions`
 - cleanup stale uploads by policy

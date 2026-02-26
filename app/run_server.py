@@ -83,6 +83,7 @@ def run_server_process(log_queue, host, port, use_https, ssl_paths=None):
                  logging.info("SSL 인증서가 로드되었습니다.")
              else:
                  logging.warning("SSL 인증서를 찾을 수 없습니다. HTTP로 실행합니다.")
+        os.environ['MESSENGER_TLS_EFFECTIVE'] = '1' if ssl_context else '0'
         
         protocol = "https" if ssl_context else "http"
         logging.info(f"서버가 시작됩니다: {protocol}://{host}:{port}")

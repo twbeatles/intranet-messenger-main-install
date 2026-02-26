@@ -117,6 +117,9 @@ def run_server(port=DEFAULT_PORT, use_https=USE_HTTPS, enable_control=True):
     if use_https and os.path.exists(SSL_CERT_PATH) and os.path.exists(SSL_KEY_PATH):
         ssl_context = (SSL_CERT_PATH, SSL_KEY_PATH)
         logger.info("SSL 인증서 로드됨")
+    elif use_https:
+        logger.warning("USE_HTTPS 요청 상태이지만 인증서가 없어 HTTP로 실행합니다.")
+    os.environ['MESSENGER_TLS_EFFECTIVE'] = '1' if ssl_context else '0'
     
     protocol = "https" if ssl_context else "http"
     logger.info(f"서버 시작: {protocol}://0.0.0.0:{port}")

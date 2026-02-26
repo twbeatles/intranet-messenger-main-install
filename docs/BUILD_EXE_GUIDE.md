@@ -61,6 +61,8 @@ pyinstaller messenger_client.spec --noconfirm --clean
   - `build/`, `dist/` 정리 후 `-Clean` 재시도
 - 누락 모듈 오류:
   - 가상환경에서 `pip install -r requirements.txt` 재실행
+  - `messenger.spec`, `messenger_client.spec`는 `collect_submodules("app"|"client")`를 사용하므로
+    신규 하위 모듈(`app/security/*`, `client/services/*`)은 기본적으로 자동 포함됨
 
 ## 5) 다음 단계 (MSI)
 

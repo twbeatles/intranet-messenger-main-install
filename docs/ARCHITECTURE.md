@@ -1,3 +1,5 @@
+[English version](../en/ARCHITECTURE.md)
+
 # 아키텍처 개요
 
 ## 목표
@@ -82,6 +84,8 @@
 
 - 입력창 `typing` 이벤트 debounce 송신(기본 500ms)
 - 텍스트/파일 모두 메시지 송신 pending/failed/retry + ACK 파이프라인으로 처리
+- 로컬 `OutboxStore`(SQLite)로 미전송 메시지 영속화, 앱 재시작 시 복구
+- 런타임 토큰 refresh 루프(만료 임계치 접근/401 1회 재시도)로 장기 세션 복원력 강화
 - 메시지/타이핑 본인 판별은 닉네임이 아니라 `user_id` 기준으로 처리
 - `read_updated`, `reaction_updated`, `message_edited`, `message_deleted`는 증분 반영 우선(실패 시 fallback reload)
 - 설정에서 업데이트 채널(`stable`/`canary`) 선택 지원
@@ -90,13 +94,27 @@
 
 - 메시지 E2E: `v2` 포맷 + `v1` 호환
 - 서버는 메시지 평문 복호화 없이 저장/중계
+- 현재 모델은 **서버 신뢰형 키 중계 모델**입니다.
+  - 서버는 방 키(`encryption_key`)를 저장하고 API로 클라이언트에 전달할 수 있습니다.
+  - 즉, "서버가 키를 알 수 없는 완전한 서버-비복호 E2E"와는 다릅니다.
 - 파일 메시지 전송은 `upload_token` 검증 필수
 - 방 생성자 퇴장 시 `created_by`는 남은 관리자 우선, 없으면 멤버에게 재할당(없으면 `NULL`)
 - Socket.IO CORS는 기본 동일 출처 정책
 - 운영 환경에서 `USE_HTTPS` 기본값은 환경변수(`MESSENGER_ENV`, `USE_HTTPS`) 기반으로 결정
+- `/api/system/health`로 TLS/DB/session guard/maintenance/rate-limit 상태 노출
+- 유지보수 정리 작업은 스케줄러(`MAINTENANCE_INTERVAL_MINUTES`) 기반 주기 실행
 
 ## 전환 정책
 
 - 하이브리드 모드: `DESKTOP_ONLY_MODE=False`
 - 데스크톱 전용 모드: `DESKTOP_ONLY_MODE=True`
 - 모드 변경 자동화: `scripts/set_cutover_mode.ps1`
+
+## 고가용성 전환(설계 착수)
+
+현행은 SQLite 단일 노드 기반입니다. 확장 단계는 다음 순서를 권장합니다.
+
+1. `SQLite` 유지 + 운영 가시성/백업 자동 검증 강화
+2. 서버형 RDBMS(예: PostgreSQL) 이행 설계 및 마이그레이션 리허설
+3. 메시지/레이트리밋 저장소 외부화(예: Redis)
+4. 다중 인스턴스 + 장애 조치(Health check + 롤링 배포)

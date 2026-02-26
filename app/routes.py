@@ -25,14 +25,17 @@ from app.models import (
     set_room_admin, is_room_admin, get_room_admins, advanced_search,
     # v4.1 추가 기능
     change_password, delete_user, get_user_session_token,
+    request_user_approval, get_user_approval_status, review_user_approval,
     # [v4.15] 파일 삭제 안전 함수
     safe_file_delete,
     # [v4.19] 성능 최적화 함수
-    get_room_last_reads
+    get_room_last_reads,
+    get_maintenance_status,
 )
 from app.utils import sanitize_input, allowed_file, validate_file_header
 from app.extensions import limiter, csrf
 from app.upload_tokens import issue_upload_token
+from app.security.upload_scanner import scan_upload_stream, scan_saved_file
 from app.auth_tokens import (
     issue_device_session,
     rotate_device_session_token,
@@ -60,6 +63,15 @@ try:
         DESKTOP_CLIENT_CANARY_LATEST_VERSION,
         DESKTOP_CLIENT_CANARY_DOWNLOAD_URL,
         DESKTOP_CLIENT_CANARY_RELEASE_NOTES_URL,
+        DESKTOP_CLIENT_ARTIFACT_SHA256,
+        DESKTOP_CLIENT_ARTIFACT_SIGNATURE,
+        DESKTOP_CLIENT_SIGNATURE_ALG,
+        DESKTOP_CLIENT_CANARY_ARTIFACT_SHA256,
+        DESKTOP_CLIENT_CANARY_ARTIFACT_SIGNATURE,
+        DESKTOP_CLIENT_CANARY_SIGNATURE_ALG,
+        ALLOW_SELF_REGISTER,
+        ENTERPRISE_AUTH_ENABLED,
+        ENTERPRISE_AUTH_PROVIDER,
     )
 except ImportError:
     import sys
@@ -78,6 +90,15 @@ except ImportError:
         DESKTOP_CLIENT_CANARY_LATEST_VERSION,
         DESKTOP_CLIENT_CANARY_DOWNLOAD_URL,
         DESKTOP_CLIENT_CANARY_RELEASE_NOTES_URL,
+        DESKTOP_CLIENT_ARTIFACT_SHA256,
+        DESKTOP_CLIENT_ARTIFACT_SIGNATURE,
+        DESKTOP_CLIENT_SIGNATURE_ALG,
+        DESKTOP_CLIENT_CANARY_ARTIFACT_SHA256,
+        DESKTOP_CLIENT_CANARY_ARTIFACT_SIGNATURE,
+        DESKTOP_CLIENT_CANARY_SIGNATURE_ALG,
+        ALLOW_SELF_REGISTER,
+        ENTERPRISE_AUTH_ENABLED,
+        ENTERPRISE_AUTH_PROVIDER,
     )
 
 logger = logging.getLogger(__name__)
@@ -216,6 +237,23 @@ def register_routes(app):
         token = payload.get('device_token', '')
         return token.strip() if isinstance(token, str) else ''
 
+    def _approval_gate_for_user(user: dict):
+        user_id = int(user.get('id') or 0)
+        if user_id <= 0:
+            return None
+        status = get_user_approval_status(user_id)
+        if status == 'pending':
+            return jsonify({'error': '계정 승인 대기 중입니다.'}), 403
+        if status == 'rejected':
+            return jsonify({'error': '승인이 거부된 계정입니다.'}), 403
+        return None
+
+    def _is_platform_admin() -> bool:
+        try:
+            return int(session.get('user_id') or 0) == 1
+        except Exception:
+            return False
+
     @app.route('/api/register', methods=['POST'])
     @csrf.exempt  # [v4.2] 회원가입은 미인증 상태이므로 CSRF 예외
     @limiter.limit("5 per minute")
@@ -237,7 +275,17 @@ def register_routes(app):
         is_valid, error_msg = validate_password(password)
         if not is_valid:
             return jsonify({'error': error_msg}), 400
-        
+
+        allow_self_register = bool(app.config.get('ALLOW_SELF_REGISTER', ALLOW_SELF_REGISTER))
+        if not allow_self_register:
+            user_id = create_user(username, password, nickname)
+            if not user_id:
+                return jsonify({'error': '이미 존재하는 아이디입니다.'}), 400
+            if not request_user_approval(int(user_id), reason='self-register-disabled'):
+                return jsonify({'error': '승인 요청 생성에 실패했습니다.'}), 500
+            log_access(user_id, 'register_pending_approval', request.remote_addr, request.user_agent.string)
+            return jsonify({'success': True, 'pending_approval': True, 'user_id': user_id}), 202
+
         user_id = create_user(username, password, nickname)
         if user_id:
             log_access(user_id, 'register', request.remote_addr, request.user_agent.string)
@@ -253,6 +301,9 @@ def register_routes(app):
         data = _json_dict()
         user = authenticate_user(data.get('username', ''), data.get('password', ''))
         if user:
+            blocked = _approval_gate_for_user(user)
+            if blocked:
+                return blocked
             new_csrf_token = _begin_user_session(user)
             log_access(user['id'], 'login', request.remote_addr, request.user_agent.string)
 
@@ -282,6 +333,9 @@ def register_routes(app):
         user = authenticate_user(username, password)
         if not user:
             return jsonify({'error': '아이디 또는 비밀번호가 올바르지 않습니다.'}), 401
+        blocked = _approval_gate_for_user(user)
+        if blocked:
+            return blocked
 
         ttl_days = DEVICE_SESSION_TTL_DAYS if remember else DEVICE_SESSION_SHORT_TTL_DAYS
         issued = issue_device_session(
@@ -396,6 +450,50 @@ def register_routes(app):
             return jsonify({'success': True, 'current_revoked': True})
         return jsonify({'success': True, 'current_revoked': False})
 
+    @app.route('/api/auth/enterprise-login', methods=['POST'])
+    @csrf.exempt
+    @limiter.limit("20 per minute")
+    def enterprise_login():
+        if not bool(app.config.get('ENTERPRISE_AUTH_ENABLED', ENTERPRISE_AUTH_ENABLED)):
+            return jsonify({'error': '엔터프라이즈 인증이 비활성화되어 있습니다.'}), 501
+        if not str(app.config.get('ENTERPRISE_AUTH_PROVIDER', ENTERPRISE_AUTH_PROVIDER) or '').strip():
+            return jsonify({'error': '엔터프라이즈 인증 제공자가 구성되지 않았습니다.'}), 400
+        return jsonify({'error': '엔터프라이즈 인증 스캐폴딩만 구현되었습니다.'}), 501
+
+    @app.route('/api/admin/users/approve', methods=['POST'])
+    def admin_approve_user():
+        if 'user_id' not in session:
+            return jsonify({'error': '로그인이 필요합니다.'}), 401
+        if not _is_platform_admin():
+            return jsonify({'error': '관리자 권한이 필요합니다.'}), 403
+
+        data = _json_dict()
+        target_user_id = data.get('user_id')
+        action = str(data.get('action') or '').strip().lower()
+        reason = str(data.get('reason') or '').strip()
+
+        try:
+            target_user_id = int(target_user_id)
+        except (TypeError, ValueError):
+            return jsonify({'error': '유효한 사용자 ID가 필요합니다.'}), 400
+        if target_user_id <= 0:
+            return jsonify({'error': '유효한 사용자 ID가 필요합니다.'}), 400
+        if action not in ('approve', 'reject'):
+            return jsonify({'error': 'action은 approve/reject만 허용됩니다.'}), 400
+        if not get_user_by_id(target_user_id):
+            return jsonify({'error': '사용자를 찾을 수 없습니다.'}), 404
+
+        if not review_user_approval(
+            user_id=target_user_id,
+            status=action,
+            reviewed_by=int(session['user_id']),
+            reason=reason,
+        ):
+            return jsonify({'error': '승인 상태 변경에 실패했습니다.'}), 500
+
+        log_access(int(session['user_id']), f'approve_user_{action}', request.remote_addr, request.user_agent.string)
+        return jsonify({'success': True, 'user_id': target_user_id, 'status': 'approved' if action == 'approve' else 'rejected'})
+
     @app.route('/api/security/audit')
     def security_audit_route():
         if 'user_id' not in session:
@@ -461,6 +559,57 @@ def register_routes(app):
                 'revoked_device_sessions_recent': revoked_recent,
             }
         )
+
+    @app.route('/api/system/health')
+    def system_health():
+        if 'user_id' not in session:
+            return jsonify({'error': '로그인이 필요합니다.'}), 401
+
+        db_ok = True
+        db_error = ''
+        try:
+            conn = get_db()
+            conn.execute('SELECT 1')
+        except Exception as e:
+            db_ok = False
+            db_error = str(e)
+
+        try:
+            from app import get_session_guard_stats
+
+            guard_stats = get_session_guard_stats()
+        except Exception:
+            guard_stats = {'fail_open_count': 0, 'last_fail_open_at': None}
+
+        tls_effective = (os.environ.get('MESSENGER_TLS_EFFECTIVE') or '').strip() == '1'
+        if not tls_effective:
+            tls_effective = bool(request.is_secure)
+
+        payload = {
+            'status': 'ok' if db_ok else 'degraded',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'tls': {
+                'configured': bool(app.config.get('SESSION_COOKIE_SECURE', False)),
+                'effective': bool(tls_effective),
+                'enforce_https': bool(app.config.get('ENFORCE_HTTPS', False)),
+            },
+            'db': {
+                'ok': bool(db_ok),
+            },
+            'session_guard': {
+                'fail_open_enabled': bool(app.config.get('SESSION_TOKEN_FAIL_OPEN', True)),
+                'fail_open_count': int(guard_stats.get('fail_open_count') or 0),
+                'last_fail_open_at': guard_stats.get('last_fail_open_at'),
+            },
+            'maintenance': get_maintenance_status(),
+            'rate_limit': {
+                'storage_uri': str(app.config.get('RATE_LIMIT_STORAGE_URI', 'memory://')),
+                'key_mode': str(app.config.get('RATE_LIMIT_KEY_MODE', 'ip')),
+            },
+        }
+        if db_error:
+            payload['db']['error'] = db_error
+        return jsonify(payload), (200 if db_ok else 503)
     
     @app.route('/api/logout', methods=['POST'])
     @csrf.exempt  # [v4.2] 로그아웃 CSRF 예외 (세션 삭제 작업으로 위험 낮음)
@@ -493,11 +642,17 @@ def register_routes(app):
             latest_version = DESKTOP_CLIENT_CANARY_LATEST_VERSION or DESKTOP_CLIENT_LATEST_VERSION
             download_url = DESKTOP_CLIENT_CANARY_DOWNLOAD_URL or DESKTOP_CLIENT_DOWNLOAD_URL
             release_notes_url = DESKTOP_CLIENT_CANARY_RELEASE_NOTES_URL or DESKTOP_CLIENT_RELEASE_NOTES_URL
+            artifact_sha256 = DESKTOP_CLIENT_CANARY_ARTIFACT_SHA256 or DESKTOP_CLIENT_ARTIFACT_SHA256
+            artifact_signature = DESKTOP_CLIENT_CANARY_ARTIFACT_SIGNATURE or DESKTOP_CLIENT_ARTIFACT_SIGNATURE
+            signature_alg = DESKTOP_CLIENT_CANARY_SIGNATURE_ALG or DESKTOP_CLIENT_SIGNATURE_ALG
         else:
             minimum_version = DESKTOP_CLIENT_MIN_VERSION
             latest_version = DESKTOP_CLIENT_LATEST_VERSION
             download_url = DESKTOP_CLIENT_DOWNLOAD_URL
             release_notes_url = DESKTOP_CLIENT_RELEASE_NOTES_URL
+            artifact_sha256 = DESKTOP_CLIENT_ARTIFACT_SHA256
+            artifact_signature = DESKTOP_CLIENT_ARTIFACT_SIGNATURE
+            signature_alg = DESKTOP_CLIENT_SIGNATURE_ALG
 
         current = _parse_version(client_version) if client_version else (0, 0, 0)
         minimum = _parse_version(minimum_version)
@@ -506,19 +661,24 @@ def register_routes(app):
         force_update = current < minimum
         update_available = current < latest
 
-        return jsonify(
-            {
-                'channel': channel,
-                'desktop_only_mode': bool(DESKTOP_ONLY_MODE),
-                'minimum_version': minimum_version,
-                'latest_version': latest_version,
-                'download_url': download_url,
-                'release_notes_url': release_notes_url,
-                'client_version': client_version or None,
-                'update_available': update_available,
-                'force_update': force_update,
-            }
-        )
+        response_payload = {
+            'channel': channel,
+            'desktop_only_mode': bool(DESKTOP_ONLY_MODE),
+            'minimum_version': minimum_version,
+            'latest_version': latest_version,
+            'download_url': download_url,
+            'release_notes_url': release_notes_url,
+            'client_version': client_version or None,
+            'update_available': update_available,
+            'force_update': force_update,
+        }
+        if artifact_sha256:
+            response_payload['artifact_sha256'] = artifact_sha256
+        if artifact_signature:
+            response_payload['artifact_signature'] = artifact_signature
+        if signature_alg:
+            response_payload['signature_alg'] = signature_alg
+        return jsonify(response_payload)
     
     @app.route('/api/users')
     def get_users():
@@ -996,11 +1156,27 @@ def register_routes(app):
                 logger.warning(f"File signature mismatch: {file.filename}")
                 return jsonify({'error': '파일 내용이 확장자와 일치하지 않습니다.'}), 400
 
+            ok, reason = scan_upload_stream(
+                file,
+                filename=str(file.filename or ''),
+                content_type=str(getattr(file, 'content_type', '') or ''),
+            )
+            if not ok:
+                return jsonify({'error': reason or '업로드 스캔 정책에 의해 차단되었습니다.'}), 400
+
             filename = secure_filename(file.filename)
             # [v4.14] UUID 추가로 동시 업로드 시 파일명 충돌 방지
             unique_filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}_{filename}"
             file_path = os.path.join(upload_folder, unique_filename)
             file.save(file_path)
+            ok, reason = scan_saved_file(
+                file_path,
+                filename=filename,
+                content_type=str(getattr(file, 'content_type', '') or ''),
+            )
+            if not ok:
+                safe_file_delete(file_path)
+                return jsonify({'error': reason or '업로드 파일 보안 검증에 실패했습니다.'}), 400
             file_size = os.path.getsize(file_path)
             ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
             file_type = 'image' if ext in {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico'} else 'file'

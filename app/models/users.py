@@ -39,6 +39,117 @@ def create_user(username: str, password: str, nickname: str | None = None) -> in
         return None
 
 
+def request_user_approval(user_id: int, reason: str = '') -> bool:
+    """사용자 승인 요청 등록"""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT id
+            FROM pending_user_approvals
+            WHERE user_id = ? AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (int(user_id),),
+        )
+        exists = cursor.fetchone()
+        if exists:
+            return True
+        cursor.execute(
+            '''
+            INSERT INTO pending_user_approvals (user_id, status, reason)
+            VALUES (?, 'pending', ?)
+            ''',
+            (int(user_id), (reason or '')[:500]),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Request user approval error: {e}")
+        return False
+
+
+def get_user_approval_status(user_id: int) -> str:
+    """
+    승인 상태 조회.
+    반환값: pending | approved | rejected | none
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT status
+            FROM pending_user_approvals
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (int(user_id),),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return 'none'
+        status = str(row['status'] or '').strip().lower()
+        if status in ('pending', 'approved', 'rejected'):
+            return status
+        return 'none'
+    except Exception as e:
+        logger.debug(f"Get user approval status error: {e}")
+        return 'none'
+
+
+def review_user_approval(user_id: int, status: str, reviewed_by: int, reason: str = '') -> bool:
+    """승인 상태 업데이트 (approve/reject)"""
+    normalized = str(status or '').strip().lower()
+    if normalized == 'approve':
+        normalized = 'approved'
+    elif normalized == 'reject':
+        normalized = 'rejected'
+    if normalized not in ('approved', 'rejected'):
+        return False
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            '''
+            SELECT id
+            FROM pending_user_approvals
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (int(user_id),),
+        )
+        latest = cursor.fetchone()
+        if latest:
+            cursor.execute(
+                '''
+                UPDATE pending_user_approvals
+                SET status = ?, reviewed_at = CURRENT_TIMESTAMP, reviewed_by = ?, reason = ?
+                WHERE id = ?
+                ''',
+                (normalized, int(reviewed_by), (reason or '')[:500], int(latest['id'])),
+            )
+        else:
+            cursor.execute(
+                '''
+                INSERT INTO pending_user_approvals (
+                    user_id, status, reviewed_at, reviewed_by, reason
+                ) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)
+                ''',
+                (int(user_id), normalized, int(reviewed_by), (reason or '')[:500]),
+            )
+        conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Review user approval error: {e}")
+        return False
+
+
 def authenticate_user(username: str, password: str) -> dict | None:
     """사용자 인증"""
     conn = get_db()

@@ -10,6 +10,7 @@ import re
 import socket
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageB
 from client.i18n import i18n_manager, t
 from client.services.api_client import APIClient, ApiError
 from client.services.crypto_compat import CryptoError, decrypt_message, encrypt_message
+from client.services.outbox_store import OutboxStore
 from client.services.session_store import SessionStore, StoredSession
 from client.services.socket_client import SocketClient
 from client.services.startup_manager import StartupManager
@@ -42,13 +44,16 @@ class MessengerAppController(QObject):
         self.i18n = i18n_manager
         self._settings = QSettings('IntranetMessenger', 'Desktop')
         self.session_store = SessionStore()
+        self.outbox_store = OutboxStore()
         self.startup_manager = StartupManager()
         self.api = APIClient(self.default_server_url, language_getter=lambda: self.i18n.display_locale)
         self.update_checker = UpdateChecker(
             self.api,
             self.client_version,
             channel_getter=lambda: self._settings.value('updates/channel', 'stable', type=str),
+            metadata_verifier=self._verify_update_metadata,
         )
+        self.api.set_unauthorized_retry_hook(self._retry_after_unauthorized)
         self.socket = SocketClient()
 
         self.login_window = LoginWindow()
@@ -63,6 +68,10 @@ class MessengerAppController(QObject):
         self.current_room_id: int | None = None
         self.current_room_key: str = ''
         self.current_device_token: str = ''
+        self._remember_device: bool = False
+        self._session_expires_at_epoch: float = 0.0
+        self._session_ttl_seconds: float = 0.0
+        self._refresh_inflight = False
         self.current_server_url: str = self.default_server_url
         self.preferred_server_url: str = self.default_server_url
         self.rooms_cache: list[dict[str, Any]] = []
@@ -91,6 +100,9 @@ class MessengerAppController(QObject):
         self._pending_send_timer = QTimer(self)
         self._pending_send_timer.setInterval(1000)
         self._pending_send_timer.timeout.connect(self._process_pending_sends)
+        self._session_refresh_timer = QTimer(self)
+        self._session_refresh_timer.setInterval(60_000)
+        self._session_refresh_timer.timeout.connect(self._refresh_device_session_if_needed)
 
         self._bind_events()
         self.i18n.subscribe(self._on_language_changed)
@@ -110,6 +122,148 @@ class MessengerAppController(QObject):
             retranslate = getattr(widget, 'retranslate_ui', None)
             if callable(retranslate):
                 retranslate()
+
+    @staticmethod
+    def _verify_update_metadata(payload: dict[str, Any]) -> tuple[bool, str]:
+        sha = str(payload.get('artifact_sha256') or '').strip()
+        sig = str(payload.get('artifact_signature') or '').strip()
+        alg = str(payload.get('signature_alg') or '').strip()
+        if not sha and not sig:
+            return True, ''
+        if not sha:
+            return False, 'artifact_sha256 is missing'
+        if not sig:
+            return False, 'artifact_signature is missing'
+        if not alg:
+            return False, 'signature_alg is missing'
+        return True, ''
+
+    @staticmethod
+    def _parse_server_ts(raw: object) -> float:
+        text = str(raw or '').strip()
+        if not text:
+            return 0.0
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+            try:
+                return datetime.strptime(text, fmt).timestamp()
+            except ValueError:
+                continue
+        return 0.0
+
+    def _update_session_expiry(self, payload: dict[str, Any]) -> None:
+        expires_epoch = self._parse_server_ts(payload.get('expires_at'))
+        self._session_expires_at_epoch = expires_epoch
+        if expires_epoch > 0:
+            now = time.time()
+            self._session_ttl_seconds = max(0.0, expires_epoch - now)
+
+    def _retry_after_unauthorized(self) -> bool:
+        return self._refresh_device_session_token(notify=False)
+
+    def _refresh_device_session_token(self, *, notify: bool = False) -> bool:
+        if self._refresh_inflight:
+            return False
+        if not self.current_device_token:
+            return False
+        self._refresh_inflight = True
+        try:
+            payload = self.api.refresh_device_session(self.current_device_token)
+            rotated = str(payload.get('device_token_rotated') or self.current_device_token).strip()
+            if not rotated:
+                return False
+            self.current_device_token = rotated
+            self._update_session_expiry(payload)
+            if self._remember_device:
+                device_name = self.default_device_name()
+                stored = self.session_store.load()
+                if stored and stored.device_name:
+                    device_name = stored.device_name
+                self.session_store.save(
+                    StoredSession(
+                        server_url=self.current_server_url,
+                        device_token=self.current_device_token,
+                        device_name=device_name,
+                    )
+                )
+            if notify:
+                self.main_window.show_info(t('controller.session_refreshed', 'Session refreshed.'))
+            return True
+        except Exception:
+            return False
+        finally:
+            self._refresh_inflight = False
+
+    def _refresh_device_session_if_needed(self) -> None:
+        if not self.current_user:
+            return
+        if not self.current_device_token:
+            return
+        if self._session_expires_at_epoch <= 0:
+            return
+        now = time.time()
+        remaining = self._session_expires_at_epoch - now
+        threshold = max(300.0, self._session_ttl_seconds * 0.2 if self._session_ttl_seconds > 0 else 0.0)
+        if remaining > threshold:
+            return
+        self._refresh_device_session_token(notify=False)
+
+    def _upsert_outbox_entry(self, client_msg_id: str, entry: dict[str, Any]) -> None:
+        if not self.current_user:
+            return
+        user_id = int((self.current_user or {}).get('id') or 0)
+        if user_id <= 0:
+            return
+        payload = entry.get('payload')
+        if not isinstance(payload, dict):
+            payload = {}
+        self.outbox_store.upsert(
+            user_id=user_id,
+            server_url=self.current_server_url,
+            client_msg_id=client_msg_id,
+            payload=payload,
+            created_at=float(entry.get('created_at') or time.time()),
+            last_attempt_at=float(entry.get('last_attempt_at') or 0.0),
+            retry_count=int(entry.get('retry_count') or 0),
+            failed=bool(entry.get('failed')),
+        )
+
+    def _remove_outbox_entry(self, client_msg_id: str) -> None:
+        if not self.current_user:
+            return
+        user_id = int((self.current_user or {}).get('id') or 0)
+        if user_id <= 0:
+            return
+        self.outbox_store.remove(
+            user_id=user_id,
+            server_url=self.current_server_url,
+            client_msg_id=client_msg_id,
+        )
+
+    def _restore_pending_sends_from_outbox(self) -> None:
+        self._pending_sends.clear()
+        self._failed_send_ids = []
+        if not self.current_user:
+            return
+        user_id = int((self.current_user or {}).get('id') or 0)
+        if user_id <= 0:
+            return
+        entries = self.outbox_store.list_entries(user_id=user_id, server_url=self.current_server_url)
+        for row in entries:
+            client_msg_id = str(row.get('client_msg_id') or '').strip()
+            payload = row.get('payload') if isinstance(row.get('payload'), dict) else {}
+            if not client_msg_id or not payload:
+                continue
+            self._pending_sends[client_msg_id] = {
+                'payload': payload,
+                'created_at': float(row.get('created_at') or time.time()),
+                'last_attempt_at': float(row.get('last_attempt_at') or 0.0),
+                'retry_count': int(row.get('retry_count') or 0),
+                'failed': bool(row.get('failed')),
+                'is_file': bool(payload.get('type') in ('file', 'image')),
+                'file_name': str(payload.get('content') or ''),
+            }
+            if bool(row.get('failed')):
+                self._failed_send_ids.append(client_msg_id)
 
     def _bind_events(self) -> None:
         self.login_window.login_requested.connect(self._on_login_requested)
@@ -279,10 +433,13 @@ class MessengerAppController(QObject):
         self.current_server_url = server_url.rstrip('/')
         self.preferred_server_url = self.current_server_url
         self.current_device_token = device_token
+        self._remember_device = bool(remember)
+        self._update_session_expiry(payload)
         self.current_room_id = None
         self.current_room_key = ''
         self._message_history_has_more = False
         self._message_history_loading = False
+        self._refresh_inflight = False
 
         if remember:
             self.session_store.save(
@@ -295,6 +452,7 @@ class MessengerAppController(QObject):
         else:
             self.session_store.clear()
 
+        self._restore_pending_sends_from_outbox()
         self.main_window.set_user(self.current_user)
         self._show_main_window()
         self.login_window.hide()
@@ -314,6 +472,10 @@ class MessengerAppController(QObject):
         self._load_rooms()
         self._check_update_policy()
         self._pending_send_timer.start()
+        self._session_refresh_timer.start()
+        for msg_id, entry in list(self._pending_sends.items()):
+            if not entry.get('failed'):
+                self._dispatch_pending_send(msg_id)
         self.tray.notify(t('app.name', 'Intranet Messenger'), t('tray.signed_in', 'Signed in successfully.'))
 
     def _show_main_window(self) -> None:
@@ -447,13 +609,15 @@ class MessengerAppController(QObject):
             'encrypted': encrypted,
             'client_msg_id': client_msg_id,
         }
-        self._pending_sends[client_msg_id] = {
+        entry = {
             'payload': payload,
-            'created_at': time.monotonic(),
+            'created_at': time.time(),
             'last_attempt_at': 0.0,
             'retry_count': 0,
             'failed': False,
         }
+        self._pending_sends[client_msg_id] = entry
+        self._upsert_outbox_entry(client_msg_id, entry)
         self._dispatch_pending_send(client_msg_id)
         self._refresh_delivery_state()
         self._typing_pending = False
@@ -480,15 +644,17 @@ class MessengerAppController(QObject):
                 'encrypted': False,
                 'client_msg_id': client_msg_id,
             }
-            self._pending_sends[client_msg_id] = {
+            entry = {
                 'payload': payload,
-                'created_at': time.monotonic(),
+                'created_at': time.time(),
                 'last_attempt_at': 0.0,
                 'retry_count': 0,
                 'failed': False,
                 'is_file': True,
                 'file_name': file_name,
             }
+            self._pending_sends[client_msg_id] = entry
+            self._upsert_outbox_entry(client_msg_id, entry)
             self._dispatch_pending_send(client_msg_id)
             self._refresh_delivery_state()
         except Exception as exc:
@@ -498,15 +664,20 @@ class MessengerAppController(QObject):
         entry = self._pending_sends.get(client_msg_id)
         if not entry:
             return
-        entry['last_attempt_at'] = time.monotonic()
+        entry['last_attempt_at'] = time.time()
         entry['failed'] = False
+        self._upsert_outbox_entry(client_msg_id, entry)
         payload = dict(entry.get('payload') or {})
 
         def _ack_callback(raw_ack: dict[str, Any] | Any) -> None:
             ack = raw_ack if isinstance(raw_ack, dict) else {}
             self._handle_send_ack(client_msg_id, ack)
 
-        self.socket.send_message(payload, ack_callback=_ack_callback)
+        try:
+            self.socket.send_message(payload, ack_callback=_ack_callback)
+        except Exception:
+            # keep pending; timeout loop will retry
+            pass
 
     def _handle_send_ack(self, client_msg_id: str, ack: dict[str, Any]) -> None:
         entry = self._pending_sends.get(client_msg_id)
@@ -521,6 +692,7 @@ class MessengerAppController(QObject):
                         t('files.upload', 'Upload') + f': {file_name}',
                     )
             self._pending_sends.pop(client_msg_id, None)
+            self._remove_outbox_entry(client_msg_id)
             if client_msg_id in self._failed_send_ids:
                 self._failed_send_ids.remove(client_msg_id)
             self._refresh_delivery_state()
@@ -528,6 +700,7 @@ class MessengerAppController(QObject):
 
         # 서버가 즉시 실패를 반환한 경우 재시도 없이 실패 처리
         entry['failed'] = True
+        self._upsert_outbox_entry(client_msg_id, entry)
         if client_msg_id not in self._failed_send_ids:
             self._failed_send_ids.append(client_msg_id)
         error_message = str(ack.get('error') or '').strip()
@@ -536,7 +709,7 @@ class MessengerAppController(QObject):
         self._refresh_delivery_state()
 
     def _process_pending_sends(self) -> None:
-        now = time.monotonic()
+        now = time.time()
         changed = False
         for client_msg_id, entry in list(self._pending_sends.items()):
             if entry.get('failed'):
@@ -550,12 +723,14 @@ class MessengerAppController(QObject):
             retries = int(entry.get('retry_count') or 0)
             if retries >= self._send_retry_limit:
                 entry['failed'] = True
+                self._upsert_outbox_entry(client_msg_id, entry)
                 if client_msg_id not in self._failed_send_ids:
                     self._failed_send_ids.append(client_msg_id)
                 changed = True
                 continue
 
             entry['retry_count'] = retries + 1
+            self._upsert_outbox_entry(client_msg_id, entry)
             self._dispatch_pending_send(client_msg_id)
             changed = True
 
@@ -571,6 +746,7 @@ class MessengerAppController(QObject):
                 continue
             entry['failed'] = False
             entry['retry_count'] = 0
+            self._upsert_outbox_entry(client_msg_id, entry)
             self._dispatch_pending_send(client_msg_id)
         self._refresh_delivery_state()
 
@@ -611,6 +787,7 @@ class MessengerAppController(QObject):
         client_msg_id = str(message.get('client_msg_id') or '').strip()
         if client_msg_id:
             self._pending_sends.pop(client_msg_id, None)
+            self._remove_outbox_entry(client_msg_id)
             if client_msg_id in self._failed_send_ids:
                 self._failed_send_ids.remove(client_msg_id)
             self._refresh_delivery_state()
@@ -1359,6 +1536,7 @@ class MessengerAppController(QObject):
         self._rooms_reload_timer.stop()
         self._typing_debounce_timer.stop()
         self._pending_send_timer.stop()
+        self._session_refresh_timer.stop()
         try:
             self.socket.disconnect()
         except Exception:
@@ -1367,11 +1545,23 @@ class MessengerAppController(QObject):
             self.api.revoke_current_device_session(self.current_device_token)
         except Exception:
             pass
+        try:
+            if self.current_user:
+                self.outbox_store.clear(
+                    user_id=int((self.current_user or {}).get('id') or 0),
+                    server_url=self.current_server_url,
+                )
+        except Exception:
+            pass
         self.session_store.clear()
         self.current_user = None
         self.current_room_id = None
         self.current_room_key = ''
         self.current_device_token = ''
+        self._remember_device = False
+        self._session_expires_at_epoch = 0.0
+        self._session_ttl_seconds = 0.0
+        self._refresh_inflight = False
         self.current_room_members = []
         self.current_admin_ids = set()
         self.current_is_admin = False
@@ -1393,6 +1583,7 @@ class MessengerAppController(QObject):
     def _quit(self) -> None:
         self._typing_debounce_timer.stop()
         self._pending_send_timer.stop()
+        self._session_refresh_timer.stop()
         try:
             self.socket.disconnect()
         except Exception:

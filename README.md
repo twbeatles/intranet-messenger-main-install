@@ -18,8 +18,9 @@ python -m client.main --server-url http://127.0.0.1:5000
 ## 핵심 기능
 
 - 데스크톱 클라이언트: 트레이 상주, 자동 실행, 세션 복원
-- 보안: E2E 암호화(v2) + v1 복호화 호환
+- 보안: 메시지 암호화(v2) + v1 복호화 호환 (서버 신뢰형 키 중계 모델)
 - 인증: `device_sessions` 기반 토큰 발급/회전/폐기
+- 운영: `GET /api/system/health` 및 정책 스위치 기반 운영 가시성
 - 서버 응답 i18n 호환: `error` 유지 + `error_code`/`error_localized` 추가
 - 웹 클라이언트: 유지보수 목적 i18n 지원(디자인 전면 개편 대상 아님)
 
@@ -29,6 +30,7 @@ python -m client.main --server-url http://127.0.0.1:5000
 - 한국어 문서 인덱스: `docs/ko/README.md`
 - 영어 문서 인덱스: `docs/en/README.md`
 - 정합성 점검 보고서(KO/EN): `docs/ko/CONSISTENCY_AUDIT_20260224.md`, `docs/en/CONSISTENCY_AUDIT_20260224.md`
+- 구현 리스크/로드맵: `OFFLINE_MESSENGER_IMPLEMENTATION_RISK_ROADMAP_20260226.md`
 - 루트 빌드/배포 가이드: `BUILD_DEPLOY_GUIDE.md`
 - 세션 가이드: `claude.md`, `gemini.md`
 

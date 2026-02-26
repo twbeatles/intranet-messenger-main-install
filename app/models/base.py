@@ -13,11 +13,11 @@ from datetime import datetime, timedelta
 
 # config 임포트 (PyInstaller 호환)
 try:
-    from config import DATABASE_PATH, UPLOAD_FOLDER
+    from config import DATABASE_PATH, UPLOAD_FOLDER, MAINTENANCE_INTERVAL_MINUTES
 except ImportError:
     import sys
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from config import DATABASE_PATH, UPLOAD_FOLDER
+    from config import DATABASE_PATH, UPLOAD_FOLDER, MAINTENANCE_INTERVAL_MINUTES
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 _db_lock = threading.Lock()
 _db_initialized = False
 _db_local = threading.local()
+_maintenance_thread = None
+_maintenance_stop = threading.Event()
+_maintenance_status = {
+    'last_run_at': None,
+    'last_results': {},
+    'scheduler_started': False,
+    'interval_minutes': int(MAINTENANCE_INTERVAL_MINUTES or 0),
+}
 
 
 def _create_connection():
@@ -121,6 +129,90 @@ def safe_file_delete(file_path: str, max_retries: int = 3) -> bool:
             if attempt < max_retries - 1:
                 time.sleep(0.3)
     return False
+
+
+def get_maintenance_status() -> dict:
+    """유지보수 스케줄러 상태 조회"""
+    return {
+        'last_run_at': _maintenance_status.get('last_run_at'),
+        'last_results': dict(_maintenance_status.get('last_results') or {}),
+        'scheduler_started': bool(_maintenance_status.get('scheduler_started')),
+        'interval_minutes': int(_maintenance_status.get('interval_minutes') or 0),
+    }
+
+
+def run_maintenance_once() -> dict:
+    """유지보수 작업 1회 실행"""
+    results = {
+        'closed_polls': 0,
+        'cleaned_access_logs': 0,
+        'cleaned_empty_rooms': 0,
+        'cleaned_device_sessions': 0,
+        'cleaned_upload_tokens': 0,
+        'cleaned_orphan_uploads': 0,
+    }
+    try:
+        results['closed_polls'] = int(close_expired_polls() or 0)
+    except Exception as e:
+        logger.warning(f"Maintenance close_expired_polls error: {e}")
+    try:
+        results['cleaned_access_logs'] = int(cleanup_old_access_logs() or 0)
+    except Exception as e:
+        logger.warning(f"Maintenance cleanup_old_access_logs error: {e}")
+    try:
+        results['cleaned_empty_rooms'] = int(cleanup_empty_rooms() or 0)
+    except Exception as e:
+        logger.warning(f"Maintenance cleanup_empty_rooms error: {e}")
+    try:
+        from app.auth_tokens import cleanup_stale_device_sessions
+
+        results['cleaned_device_sessions'] = int(cleanup_stale_device_sessions() or 0)
+    except Exception as e:
+        logger.warning(f"Maintenance cleanup_stale_device_sessions error: {e}")
+    try:
+        from app.upload_tokens import purge_expired_upload_tokens, cleanup_orphan_upload_files
+
+        results['cleaned_upload_tokens'] = int(purge_expired_upload_tokens() or 0)
+        results['cleaned_orphan_uploads'] = int(cleanup_orphan_upload_files() or 0)
+    except Exception as e:
+        logger.warning(f"Maintenance upload cleanup error: {e}")
+
+    _maintenance_status['last_run_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    _maintenance_status['last_results'] = dict(results)
+    return results
+
+
+def _start_maintenance_scheduler_if_needed() -> None:
+    """백그라운드 유지보수 스케줄러 시작"""
+    global _maintenance_thread
+
+    if os.environ.get('PYTEST_CURRENT_TEST'):
+        return
+    if _maintenance_thread is not None and _maintenance_thread.is_alive():
+        return
+
+    interval = int(MAINTENANCE_INTERVAL_MINUTES or 0)
+    if interval <= 0:
+        return
+
+    _maintenance_status['interval_minutes'] = interval
+    _maintenance_stop.clear()
+
+    def _worker():
+        logger.info(f"Maintenance scheduler started (interval={interval}m)")
+        while not _maintenance_stop.wait(interval * 60):
+            try:
+                run_maintenance_once()
+            except Exception as e:
+                logger.warning(f"Maintenance scheduler tick error: {e}")
+
+    _maintenance_thread = threading.Thread(
+        target=_worker,
+        name='maintenance-scheduler',
+        daemon=True,
+    )
+    _maintenance_thread.start()
+    _maintenance_status['scheduler_started'] = True
 
 
 def init_db():
@@ -345,6 +437,38 @@ def init_db():
             )
             '''
         )
+
+        # Approval workflow scaffold (A2)
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS pending_user_approvals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TIMESTAMP,
+                reviewed_by INTEGER,
+                reason TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (reviewed_by) REFERENCES users(id)
+            )
+            '''
+        )
+
+        # Legal hold scaffold (A5)
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS legal_holds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hold_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                released_at TIMESTAMP
+            )
+            '''
+        )
         
         # Auto-migration
         required_columns = {
@@ -361,6 +485,9 @@ def init_db():
             'device_sessions': {
                 'remember': 'INTEGER DEFAULT 1',
                 'ttl_days': 'INTEGER DEFAULT 30',
+            },
+            'pending_user_approvals': {
+                'reason': 'TEXT',
             }
         }
 
@@ -420,6 +547,18 @@ def init_db():
             cursor.execute(
                 'CREATE INDEX IF NOT EXISTS idx_upload_tokens_room_user '
                 'ON upload_tokens(room_id, user_id)'
+            )
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_pending_user_approvals_user_status '
+                'ON pending_user_approvals(user_id, status)'
+            )
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_pending_user_approvals_status_requested '
+                'ON pending_user_approvals(status, requested_at)'
+            )
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_legal_holds_type_target_active '
+                'ON legal_holds(hold_type, target_id, active)'
             )
 
             # Full-text search (FTS5) for plaintext (encrypted=0) text/system messages.
@@ -496,28 +635,11 @@ def init_db():
             except Exception:
                 pass
     
-    # 서버 시작 시 유지보수 작업 실행 (별도 연결 사용)
+    # 서버 시작 시 유지보수 작업 + 주기 스케줄러
     try:
-        close_expired_polls()
-        cleanup_old_access_logs()
-        cleanup_empty_rooms()
-        try:
-            from app.auth_tokens import cleanup_stale_device_sessions
-            cleaned_sessions = cleanup_stale_device_sessions()
-            if cleaned_sessions > 0:
-                logger.info(f"Cleaned up {cleaned_sessions} stale device sessions")
-        except Exception as token_cleanup_error:
-            logger.warning(f"Device session cleanup error: {token_cleanup_error}")
-        try:
-            from app.upload_tokens import purge_expired_upload_tokens, cleanup_orphan_upload_files
-            cleaned_tokens = purge_expired_upload_tokens()
-            cleaned_orphans = cleanup_orphan_upload_files()
-            if cleaned_tokens > 0:
-                logger.info(f"Cleaned up {cleaned_tokens} stale upload tokens")
-            if cleaned_orphans > 0:
-                logger.info(f"Cleaned up {cleaned_orphans} orphan upload files")
-        except Exception as upload_cleanup_error:
-            logger.warning(f"Upload cleanup error: {upload_cleanup_error}")
+        results = run_maintenance_once()
+        logger.info(f"Startup maintenance completed: {results}")
+        _start_maintenance_scheduler_if_needed()
     except Exception as e:
         logger.warning(f"Maintenance tasks error: {e}")
 
@@ -550,7 +672,19 @@ def cleanup_old_access_logs(days_to_keep=90):
     cursor = conn.cursor()
     try:
         cutoff_date = (datetime.now() - timedelta(days=days_to_keep)).strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute('DELETE FROM access_logs WHERE created_at < ?', (cutoff_date,))
+        cursor.execute(
+            '''
+            DELETE FROM access_logs
+            WHERE created_at < ?
+              AND id NOT IN (
+                  SELECT CAST(target_id AS INTEGER)
+                  FROM legal_holds
+                  WHERE hold_type = 'access_log'
+                    AND active = 1
+              )
+            ''',
+            (cutoff_date,),
+        )
         count = cursor.rowcount
         conn.commit()
         if count > 0:

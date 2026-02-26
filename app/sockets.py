@@ -7,7 +7,7 @@ import logging
 import time
 import traceback
 from threading import Lock
-from flask import session, request
+from flask import session, request, current_app
 from flask_socketio import emit, join_room, leave_room
 
 from app.api_response import build_socket_error_payload
@@ -20,6 +20,10 @@ from app.models import (
     get_poll, get_pinned_messages, get_room_admins
 )
 from app.upload_tokens import consume_upload_token, get_upload_token_failure_reason
+try:
+    from config import REQUIRE_MESSAGE_ENCRYPTION
+except ImportError:
+    REQUIRE_MESSAGE_ENCRYPTION = False
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +315,10 @@ def register_socket_events(socketio):
             client_msg_id = client_msg_id.strip()[:64]
 
             if message_type == 'text':
+                enforce_encryption = bool(current_app.config.get('REQUIRE_MESSAGE_ENCRYPTION', REQUIRE_MESSAGE_ENCRYPTION))
+                if enforce_encryption and not encrypted:
+                    _emit_error_i18n('암호화되지 않은 텍스트 메시지는 허용되지 않습니다.')
+                    return {'ok': False, 'error': '암호화되지 않은 텍스트 메시지는 허용되지 않습니다.'}
                 if encrypted:
                     # Do not truncate ciphertext; reject only extreme payload size.
                     if len(content) > 200000:

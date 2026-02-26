@@ -17,6 +17,8 @@ from app.models.base import (
     close_thread_db,
     get_db_context,
     init_db,
+    get_maintenance_status,
+    run_maintenance_once,
     safe_file_delete,
     close_expired_polls,
     cleanup_old_access_logs,
@@ -26,6 +28,9 @@ from app.models.base import (
 # Users - 사용자 관리
 from app.models.users import (
     create_user,
+    request_user_approval,
+    get_user_approval_status,
+    review_user_approval,
     authenticate_user,
     get_user_by_id,
     get_user_by_id_cached,
@@ -109,10 +114,13 @@ from app.models.reactions import (
 
 __all__ = [
     # Base
-    'get_db', 'close_thread_db', 'get_db_context', 'init_db', 'safe_file_delete',
+    'get_db', 'close_thread_db', 'get_db_context', 'init_db',
+    'get_maintenance_status', 'run_maintenance_once',
+    'safe_file_delete',
     'close_expired_polls', 'cleanup_old_access_logs', 'cleanup_empty_rooms',
     # Users
     'create_user', 'authenticate_user', 'get_user_by_id', 'get_user_by_id_cached',
+    'request_user_approval', 'get_user_approval_status', 'review_user_approval',
     'invalidate_user_cache', 'get_all_users', 'update_user_status', 'update_user_profile',
     'get_online_users', 'log_access', 'change_password', 'get_user_session_token', 'delete_user',
     # Rooms

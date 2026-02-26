@@ -8,7 +8,7 @@ import os
 import sys
 import logging
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 # gevent monkey patching (반드시 다른 import 전에 실행)
 # [v4.1] GUI 모드에서는 PyQt6와 충돌하므로 비활성화
@@ -57,7 +57,13 @@ try:
         STATIC_FOLDER, TEMPLATE_FOLDER,
         ASYNC_MODE, PING_TIMEOUT, PING_INTERVAL, MAX_HTTP_BUFFER_SIZE,
         MAX_CONNECTIONS, MESSAGE_QUEUE,
-        SOCKETIO_CORS_ALLOWED_ORIGINS
+        SOCKETIO_CORS_ALLOWED_ORIGINS,
+        RATE_LIMIT_STORAGE_URI, RATE_LIMIT_KEY_MODE,
+        SESSION_TOKEN_FAIL_OPEN,
+        ENFORCE_HTTPS, ALLOW_SELF_REGISTER,
+        UPLOAD_SCAN_ENABLED, UPLOAD_SCAN_PROVIDER,
+        ENTERPRISE_AUTH_ENABLED, ENTERPRISE_AUTH_PROVIDER,
+        REQUIRE_MESSAGE_ENCRYPTION,
     )
 except ImportError:
     # 패키징된 환경에서 상대 경로 시도
@@ -69,7 +75,13 @@ except ImportError:
         STATIC_FOLDER, TEMPLATE_FOLDER,
         ASYNC_MODE, PING_TIMEOUT, PING_INTERVAL, MAX_HTTP_BUFFER_SIZE,
         MAX_CONNECTIONS, MESSAGE_QUEUE,
-        SOCKETIO_CORS_ALLOWED_ORIGINS
+        SOCKETIO_CORS_ALLOWED_ORIGINS,
+        RATE_LIMIT_STORAGE_URI, RATE_LIMIT_KEY_MODE,
+        SESSION_TOKEN_FAIL_OPEN,
+        ENFORCE_HTTPS, ALLOW_SELF_REGISTER,
+        UPLOAD_SCAN_ENABLED, UPLOAD_SCAN_PROVIDER,
+        ENTERPRISE_AUTH_ENABLED, ENTERPRISE_AUTH_PROVIDER,
+        REQUIRE_MESSAGE_ENCRYPTION,
     )
 
 # 로깅 설정
@@ -103,6 +115,17 @@ logger = logging.getLogger(__name__)
 
 # SocketIO 인스턴스 (전역)
 socketio = None
+session_guard_stats = {
+    'fail_open_count': 0,
+    'last_fail_open_at': None,
+}
+
+
+def get_session_guard_stats() -> dict:
+    return {
+        'fail_open_count': int(session_guard_stats.get('fail_open_count') or 0),
+        'last_fail_open_at': session_guard_stats.get('last_fail_open_at'),
+    }
 
 
 def create_app():
@@ -111,11 +134,55 @@ def create_app():
 
     # 테스트/런타임에서 config가 동적으로 바뀌는 경우를 반영한다.
     runtime_upload_folder = UPLOAD_FOLDER
+    runtime_rate_limit_storage_uri = RATE_LIMIT_STORAGE_URI
+    runtime_rate_limit_key_mode = RATE_LIMIT_KEY_MODE
+    runtime_session_token_fail_open = SESSION_TOKEN_FAIL_OPEN
+    runtime_enforce_https = ENFORCE_HTTPS
+    runtime_allow_self_register = ALLOW_SELF_REGISTER
+    runtime_upload_scan_enabled = UPLOAD_SCAN_ENABLED
+    runtime_upload_scan_provider = UPLOAD_SCAN_PROVIDER
+    runtime_enterprise_auth_enabled = ENTERPRISE_AUTH_ENABLED
+    runtime_enterprise_auth_provider = ENTERPRISE_AUTH_PROVIDER
+    runtime_require_message_encryption = REQUIRE_MESSAGE_ENCRYPTION
     try:
         import config as runtime_config  # type: ignore
 
         runtime_upload_folder = str(
             getattr(runtime_config, 'UPLOAD_FOLDER', runtime_upload_folder) or runtime_upload_folder
+        )
+        runtime_rate_limit_storage_uri = str(
+            getattr(runtime_config, 'RATE_LIMIT_STORAGE_URI', runtime_rate_limit_storage_uri)
+            or runtime_rate_limit_storage_uri
+        )
+        runtime_rate_limit_key_mode = str(
+            getattr(runtime_config, 'RATE_LIMIT_KEY_MODE', runtime_rate_limit_key_mode)
+            or runtime_rate_limit_key_mode
+        )
+        runtime_session_token_fail_open = bool(
+            getattr(runtime_config, 'SESSION_TOKEN_FAIL_OPEN', runtime_session_token_fail_open)
+        )
+        runtime_enforce_https = bool(
+            getattr(runtime_config, 'ENFORCE_HTTPS', runtime_enforce_https)
+        )
+        runtime_allow_self_register = bool(
+            getattr(runtime_config, 'ALLOW_SELF_REGISTER', runtime_allow_self_register)
+        )
+        runtime_upload_scan_enabled = bool(
+            getattr(runtime_config, 'UPLOAD_SCAN_ENABLED', runtime_upload_scan_enabled)
+        )
+        runtime_upload_scan_provider = str(
+            getattr(runtime_config, 'UPLOAD_SCAN_PROVIDER', runtime_upload_scan_provider)
+            or runtime_upload_scan_provider
+        )
+        runtime_enterprise_auth_enabled = bool(
+            getattr(runtime_config, 'ENTERPRISE_AUTH_ENABLED', runtime_enterprise_auth_enabled)
+        )
+        runtime_enterprise_auth_provider = str(
+            getattr(runtime_config, 'ENTERPRISE_AUTH_PROVIDER', runtime_enterprise_auth_provider)
+            or runtime_enterprise_auth_provider
+        )
+        runtime_require_message_encryption = bool(
+            getattr(runtime_config, 'REQUIRE_MESSAGE_ENCRYPTION', runtime_require_message_encryption)
         )
     except Exception:
         pass
@@ -170,6 +237,17 @@ def create_app():
     app.config['SESSION_COOKIE_HTTPONLY'] = True
     app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
     app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=SESSION_TIMEOUT_HOURS)
+    app.config['RATELIMIT_STORAGE_URI'] = runtime_rate_limit_storage_uri
+    app.config['RATE_LIMIT_STORAGE_URI'] = runtime_rate_limit_storage_uri
+    app.config['RATE_LIMIT_KEY_MODE'] = runtime_rate_limit_key_mode
+    app.config['SESSION_TOKEN_FAIL_OPEN'] = runtime_session_token_fail_open
+    app.config['ENFORCE_HTTPS'] = runtime_enforce_https
+    app.config['ALLOW_SELF_REGISTER'] = runtime_allow_self_register
+    app.config['UPLOAD_SCAN_ENABLED'] = runtime_upload_scan_enabled
+    app.config['UPLOAD_SCAN_PROVIDER'] = runtime_upload_scan_provider
+    app.config['ENTERPRISE_AUTH_ENABLED'] = runtime_enterprise_auth_enabled
+    app.config['ENTERPRISE_AUTH_PROVIDER'] = runtime_enterprise_auth_provider
+    app.config['REQUIRE_MESSAGE_ENCRYPTION'] = runtime_require_message_encryption
     
     # [v4.6+] Server-Side Session (CacheLib backend)
     session_dir = os.path.join(BASE_DIR, 'flask_session')
@@ -249,6 +327,10 @@ def create_app():
     register_routes(app)
     
     # [v4.3] 보안 확장 초기화
+    try:
+        limiter._storage_uri = runtime_rate_limit_storage_uri  # type: ignore[attr-defined]
+    except Exception:
+        pass
     limiter.init_app(app)
     csrf.init_app(app)
     
@@ -286,9 +368,23 @@ def create_app():
                 return None
             if session.get('session_token') == current_token:
                 return None
-        except Exception:
-            # Fail-open to avoid hard lockout on transient DB failures.
-            return None
+        except Exception as e:
+            if bool(app.config.get('SESSION_TOKEN_FAIL_OPEN', True)):
+                # Default behavior: fail-open in case of transient DB error.
+                session_guard_stats['fail_open_count'] = int(session_guard_stats.get('fail_open_count') or 0) + 1
+                session_guard_stats['last_fail_open_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                logger.warning(f"Session token guard fail-open: {e}")
+                return None
+            logger.error(f"Session token guard fail-closed: {e}")
+            session.clear()
+            return (
+                json.dumps(
+                    {'error': '세션 검증 시스템 오류입니다. 잠시 후 다시 시도해주세요.'},
+                    ensure_ascii=False,
+                ),
+                503,
+                {'Content-Type': 'application/json; charset=utf-8'},
+            )
 
         session.clear()
         return (

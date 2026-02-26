@@ -359,6 +359,20 @@ def cleanup_orphan_upload_files(*, grace_seconds: int | None = None) -> int:
         (_now_ts(),),
     )
     tracked_paths.update(_normalize_rel_path(row['file_path']) for row in cursor.fetchall() if row['file_path'])
+    held_paths: set[str] = set()
+    try:
+        cursor.execute(
+            '''
+            SELECT target_id
+            FROM legal_holds
+            WHERE hold_type = 'file_path'
+              AND active = 1
+            '''
+        )
+        held_paths.update(_normalize_rel_path(row['target_id']) for row in cursor.fetchall() if row['target_id'])
+    except Exception:
+        # legal_holds table may not exist on very old snapshots
+        held_paths = set()
 
     removed = 0
     upload_root = os.path.realpath(_get_upload_folder())
@@ -380,6 +394,8 @@ def cleanup_orphan_upload_files(*, grace_seconds: int | None = None) -> int:
                 continue
             rel_path = _normalize_rel_path(os.path.join(rel_dir, name))
             if rel_path in tracked_paths:
+                continue
+            if rel_path in held_paths:
                 continue
 
             full_path = os.path.join(root, name)

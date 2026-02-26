@@ -59,7 +59,8 @@ def run_server_cli():
     
     app, socketio = create_app()
     ssl_context = check_ssl_certificates()
-    
+    os.environ['MESSENGER_TLS_EFFECTIVE'] = '1' if ssl_context else '0'
+
     protocol = "https" if ssl_context else "http"
     print(f"\n{'='*50}")
     print(f"사내 메신저 서버 v4.36")
@@ -71,6 +72,8 @@ def run_server_cli():
         print(f"SSL: 활성화 (자체 서명 인증서)")
     else:
         print(f"SSL: 비활성화")
+        if USE_HTTPS:
+            print("경고: USE_HTTPS=True이지만 인증서를 로드하지 못해 HTTP로 실행됩니다.")
     print(f"{'='*50}\n")
     
     try:

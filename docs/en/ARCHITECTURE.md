@@ -84,6 +84,8 @@ Keep existing features/business logic while removing browser dependency and movi
 
 - outbound typing with debounce (default 500ms)
 - text/file sends share one pending/failed/retry + ACK pipeline
+- local `OutboxStore` (SQLite) persists unsent messages and restores them after restart
+- runtime token refresh loop (near-expiry + one-time retry on 401) improves long-session resiliency
 - own-message and own-typing checks are based on `user_id` (not nickname)
 - `read_updated`, `reaction_updated`, `message_edited`, `message_deleted` prefer incremental UI updates (fallback reload on miss)
 - settings UI supports update channel selection (`stable`/`canary`)
@@ -92,13 +94,27 @@ Keep existing features/business logic while removing browser dependency and movi
 
 - Message E2E: v2 format with v1 compatibility
 - Server stores/relays encrypted content without plaintext decrypt
+- Current model is a **server-trust key relay model**.
+  - The server can store room keys and deliver them to clients via API.
+  - This is not equivalent to strict server-blind E2E where the server never has key access.
 - File message send requires `upload_token`
 - when room creator leaves, `created_by` is reassigned (remaining admin first, then member, else `NULL`)
 - Socket.IO CORS default is same-origin
 - `USE_HTTPS` default is environment-driven (`MESSENGER_ENV`, `USE_HTTPS`) for production safety
+- `/api/system/health` exposes TLS/DB/session-guard/maintenance/rate-limit status
+- maintenance cleanup jobs run on a scheduler (`MAINTENANCE_INTERVAL_MINUTES`)
 
 ## Cutover Modes
 
 - Hybrid mode: `DESKTOP_ONLY_MODE=False`
 - Desktop-only mode: `DESKTOP_ONLY_MODE=True`
 - Mode automation: `scripts/set_cutover_mode.ps1`
+
+## High Availability Transition (Design Track)
+
+Current runtime is SQLite single-node. Recommended staged path:
+
+1. Keep SQLite and strengthen observability/backup verification
+2. Design and rehearse migration to server-grade RDBMS (e.g., PostgreSQL)
+3. Externalize shared runtime state (e.g., Redis for queue/rate limit state)
+4. Move to multi-instance deployment with health checks and controlled rollout

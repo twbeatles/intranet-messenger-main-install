@@ -1,7 +1,7 @@
 # GEMINI.md
 
 프로젝트: `intranet-messenger-main-install`  
-최종 업데이트: 2026-02-25
+최종 업데이트: 2026-02-26
 
 ## 1) 이 문서의 역할
 
@@ -12,11 +12,16 @@ Gemini 기반 새 작업 세션이 시작될 때, 현재 프로젝트의 운영 
 1. `README.md`
 2. `README.en.md`
 3. `TRANSITION_CHECKLIST.md` (deprecated, 대체: `docs/CUTOVER_ROLLBACK.md`, `docs/OPERATIONS_RUNBOOK.md`)
-4. `FUNCTIONAL_REVIEW_20260223.md` (deprecated, 대체: `IMPLEMENTATION_RISK_AUDIT_20260225.md`)
+4. `OFFLINE_MESSENGER_IMPLEMENTATION_RISK_ROADMAP_20260226.md`
 5. `docs/README.md` (`docs/ko`, `docs/en` 인덱스)
 6. 작업 대상 코드 파일
 
-## 3) 프로젝트 스냅샷 (2026-02-25 기준)
+### 리스크 수용 메모 (R1)
+
+- 현재 저장소에서는 `IMPLEMENTATION_RISK_AUDIT_20260224.md`, `IMPLEMENTATION_RISK_AUDIT_20260225.md`가 삭제 상태일 수 있음.
+- 본 세션 기준 정책: **복구하지 않고 삭제 상태를 유지**하며, 대체 기준 문서로 `OFFLINE_MESSENGER_IMPLEMENTATION_RISK_ROADMAP_20260226.md`를 사용.
+
+## 3) 프로젝트 스냅샷 (2026-02-26 기준)
 
 - 제품: 사내 메신저 Desktop-First 전환
 - 서버: `Flask + Socket.IO + SQLite`
@@ -27,8 +32,8 @@ Gemini 기반 새 작업 세션이 시작될 때, 현재 프로젝트의 운영 
   - 카탈로그: `i18n/ko/*`, `i18n/en/*`
   - API 에러 호환: `error` 유지 + `error_code`, `error_localized`, `locale` 추가
 - 테스트 기준:
-  - `pytest tests -q` -> `116 passed`
-  - `pytest --maxfail=1` -> `116 passed`
+  - `pytest tests -q` -> `136 passed`
+  - `pytest --maxfail=1` -> `136 passed`
 - 배포 기준:
   - 서버 EXE: `messenger.spec`
   - 클라이언트 EXE: `messenger_client.spec`
@@ -47,7 +52,8 @@ Gemini 기반 새 작업 세션이 시작될 때, 현재 프로젝트의 운영 
 
 - `v2` 포맷 완전 호환 유지
 - `v1 (U2FsdGVkX...)` 복호화 호환 유지
-- 서버는 E2E 평문 복호화하지 않음
+- 서버는 일반 경로에서 E2E 평문 복호화를 수행하지 않음
+- 단, 현재 모델은 서버 신뢰형 키 중계 모델이며 strict server-blind E2E는 아님
 
 ### 4.3 API/소켓 계약
 
@@ -78,13 +84,13 @@ Gemini 기반 새 작업 세션이 시작될 때, 현재 프로젝트의 운영 
 
 ## 6) 현재 우선 점검 대상 (Open Items)
 
-`IMPLEMENTATION_RISK_AUDIT_20260225.md` 기준:
+`OFFLINE_MESSENGER_IMPLEMENTATION_RISK_ROADMAP_20260226.md` 기준:
 
-1. 업로드 토큰 정리 주기/보관 정책 운영값 확정
-2. orphan 파일 정리 작업의 운영 모니터링 지표 추가
-3. 확장 파일 시그니처 검증의 오탐/누락 관찰 및 정책 보정
-4. `room_updated` 증분 업데이트 고도화(추가 API 호출 축소)
-5. 릴리즈 시 문서 테스트 수치/날짜 동기화 유지
+1. `ENTERPRISE_AUTH_PROVIDER` 실제 연동(AD/LDAP/SSO) 구현
+2. `UPLOAD_SCAN_PROVIDER` 실스캐너 연동 및 운영 정책 보정
+3. 업데이트 서명/해시 검증 강제 정책(배포 파이프라인 포함) 확정
+4. SQLite -> 서버형 RDBMS/외부 MQ 전환 리허설 구체화
+5. DR 리허설 정례화 및 장애주입 시나리오 확대
 
 ## 7) 자주 쓰는 명령
 
@@ -102,7 +108,7 @@ Gemini 기반 새 작업 세션이 시작될 때, 현재 프로젝트의 운영 
 ## 8) Gemini 시작 프롬프트 템플릿
 
 ```text
-Read `gemini.md`, `README.md`, and `IMPLEMENTATION_RISK_AUDIT_20260225.md`.
+Read `gemini.md`, `README.md`, and `OFFLINE_MESSENGER_IMPLEMENTATION_RISK_ROADMAP_20260226.md`.
 Before editing, provide:
 1) baseline summary,
 2) non-negotiable contracts in this scope,

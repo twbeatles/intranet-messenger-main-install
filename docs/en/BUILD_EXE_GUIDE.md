@@ -62,6 +62,8 @@ Client only:
   - clean `build/`, `dist/` and retry with `-Clean`
 - missing module error:
   - run `pip install -r requirements.txt` again inside venv
+  - `messenger.spec` and `messenger_client.spec` use `collect_submodules("app"|"client")`,
+    so new submodules (`app/security/*`, `client/services/*`) are included by default
 
 ## 5) Next Step (MSI)
 

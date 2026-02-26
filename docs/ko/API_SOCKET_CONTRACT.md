@@ -80,12 +80,16 @@
   - `channel`, `desktop_only_mode`
   - `minimum_version`, `latest_version`
   - `download_url`, `release_notes_url`
+  - 선택 메타: `artifact_sha256`, `artifact_signature`, `signature_alg`
   - `update_available`, `force_update`
 
 ## 주요 REST API
 
 - 인증: `/api/register`, `/api/login`, `/api/logout`, `/api/me`
+- 엔터프라이즈 인증(스캐폴딩): `/api/auth/enterprise-login`
+- 승인 워크플로(스캐폴딩): `/api/admin/users/approve`
 - 사용자: `/api/users`, `/api/users/online`, `/api/profile`
+- 운영 헬스: `/api/system/health`
 - 방:
   - `/api/rooms` (GET/POST)
   - `/api/rooms/<room_id>/messages`
@@ -178,6 +182,7 @@
 - 클라이언트 입력 `type=system`은 즉시 거부(서버 내부 이벤트 전용 타입)
 - `reply_to`는 동일 `room_id` 메시지만 허용
 - 파일/이미지는 `upload_token` 필수
+- `REQUIRE_MESSAGE_ENCRYPTION=True`면 `type=text`에서 `encrypted=true` 필수
 - 잘못된 방 접근, 잘못된 payload 차단
 - `client_msg_id`가 있으면 `(room_id, sender_id, client_msg_id)` 기준 idempotency 적용
 

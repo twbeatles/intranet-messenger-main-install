@@ -28,6 +28,7 @@ class APIClient:
         self._client = httpx.Client(base_url=self.base_url, timeout=timeout)
         self._csrf_token = ''
         self._language_getter = language_getter
+        self._unauthorized_retry_hook = None
 
     def update_base_url(self, base_url: str) -> None:
         self.base_url = base_url.rstrip('/')
@@ -37,6 +38,10 @@ class APIClient:
 
     def set_language_getter(self, language_getter) -> None:
         self._language_getter = language_getter
+
+    def set_unauthorized_retry_hook(self, hook) -> None:
+        """Hook should return True when refresh/recovery succeeded and one retry is allowed."""
+        self._unauthorized_retry_hook = hook
 
     def close(self) -> None:
         self._client.close()
@@ -64,18 +69,39 @@ class APIClient:
         json_data: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
+        allow_retry: bool = True,
     ) -> Any:
-        response = self._client.request(
-            method,
-            path,
-            json=json_data,
-            params=params,
-            headers=self._headers(headers),
-        )
-        content_type = response.headers.get('content-type', '')
+        attempts = 2 if allow_retry else 1
+        response = None
         payload: Any = {}
-        if 'application/json' in content_type:
-            payload = response.json()
+
+        for attempt in range(attempts):
+            response = self._client.request(
+                method,
+                path,
+                json=json_data,
+                params=params,
+                headers=self._headers(headers),
+            )
+            content_type = response.headers.get('content-type', '')
+            payload = {}
+            if 'application/json' in content_type:
+                payload = response.json()
+
+            if (
+                response.status_code == 401
+                and attempt == 0
+                and callable(self._unauthorized_retry_hook)
+            ):
+                try:
+                    if bool(self._unauthorized_retry_hook()):
+                        continue
+                except Exception:
+                    pass
+            break
+
+        if response is None:
+            raise ApiError('HTTP request failed', status_code=500, error_code='')
 
         if response.status_code >= 400:
             error_code = ''
@@ -147,6 +173,7 @@ class APIClient:
             '/api/device-sessions/refresh',
             json_data={'device_token': device_token},
             headers={'X-Device-Token': device_token},
+            allow_retry=False,
         )
         self._csrf_token = payload.get('csrf_token', '')
         return payload
@@ -293,13 +320,28 @@ class APIClient:
             raise RuntimeError(t('files.local_not_found', 'File not found.'))
 
         mime, _ = mimetypes.guess_type(str(file_obj))
-        with file_obj.open('rb') as fp:
-            response = self._client.post(
-                '/api/upload',
-                data={'room_id': str(room_id)},
-                files={'file': (file_obj.name, fp, mime or 'application/octet-stream')},
-                headers=self._headers(),
-            )
+        response = None
+        for attempt in range(2):
+            with file_obj.open('rb') as fp:
+                response = self._client.post(
+                    '/api/upload',
+                    data={'room_id': str(room_id)},
+                    files={'file': (file_obj.name, fp, mime or 'application/octet-stream')},
+                    headers=self._headers(),
+                )
+            if (
+                response.status_code == 401
+                and attempt == 0
+                and callable(self._unauthorized_retry_hook)
+            ):
+                try:
+                    if bool(self._unauthorized_retry_hook()):
+                        continue
+                except Exception:
+                    pass
+            break
+        if response is None:
+            raise ApiError('HTTP upload failed', status_code=500, error_code='')
         payload = response.json() if 'application/json' in response.headers.get('content-type', '') else {}
         if response.status_code >= 400:
             message = payload.get('error_localized') or payload.get('error') or f'HTTP {response.status_code}'
@@ -309,7 +351,22 @@ class APIClient:
 
     def download_upload_file(self, remote_file_path: str, save_path: str) -> str:
         encoded_path = '/'.join(quote(part) for part in remote_file_path.split('/'))
-        response = self._client.get(f'/uploads/{encoded_path}', headers=self._headers())
+        response = None
+        for attempt in range(2):
+            response = self._client.get(f'/uploads/{encoded_path}', headers=self._headers())
+            if (
+                response.status_code == 401
+                and attempt == 0
+                and callable(self._unauthorized_retry_hook)
+            ):
+                try:
+                    if bool(self._unauthorized_retry_hook()):
+                        continue
+                except Exception:
+                    pass
+            break
+        if response is None:
+            raise ApiError('HTTP download failed', status_code=500, error_code='')
         if response.status_code >= 400:
             payload = response.json() if 'application/json' in response.headers.get('content-type', '') else {}
             message = payload.get('error_localized') or payload.get('error') or f'HTTP {response.status_code}'
