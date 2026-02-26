@@ -36,15 +36,28 @@ class LoginWindow(QDialog):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(16)
+        root.setContentsMargins(40, 36, 40, 36)
+        root.setSpacing(20)
 
+        # 타이틀부 여유
+        title_box = QVBoxLayout()
+        title_box.setSpacing(6)
+        title_box.setAlignment(Qt.AlignCenter)
+        
         title = QLabel('')
         title.setProperty('title', True)
+        title.setAlignment(Qt.AlignCenter)
+        
         subtitle = QLabel('')
         subtitle.setProperty('subtitle', True)
-        root.addWidget(title)
-        root.addWidget(subtitle)
+        subtitle.setAlignment(Qt.AlignCenter)
+        
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        
+        root.addLayout(title_box)
+        root.addSpacing(10)
+        
         self._title_label = title
         self._subtitle_label = subtitle
 
@@ -53,19 +66,21 @@ class LoginWindow(QDialog):
         root.addWidget(card)
 
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(18, 18, 18, 18)
-        card_layout.setSpacing(14)
+        card_layout.setContentsMargins(32, 32, 32, 32)
+        card_layout.setSpacing(20)
 
         section = QLabel('')
         section.setProperty('section', True)
         card_layout.addWidget(section)
+        card_layout.addSpacing(4)
         self._section_label = section
 
+        # Form - 필드 여백(간격) 최적화로 모던하게 띄움
         form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         form.setFormAlignment(Qt.AlignTop)
-        form.setHorizontalSpacing(14)
-        form.setVerticalSpacing(10)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(16)
 
         self.server_url_input = QLineEdit('http://127.0.0.1:5000')
         self.server_url_label = QLabel('')
@@ -88,29 +103,41 @@ class LoginWindow(QDialog):
         self.device_name_label = QLabel('')
         form.addRow(self.device_name_label, self.device_name_input)
 
+        # remember_check row 에 약간의 padding 추가용 vlayout 처리
+        rem_layout = QVBoxLayout()
+        rem_layout.setContentsMargins(0, 4, 0, 8)
         self.remember_check = QCheckBox('')
         self.remember_check.setChecked(True)
-        form.addRow('', self.remember_check)
+        rem_layout.addWidget(self.remember_check)
+        form.addRow('', rem_layout)
 
         card_layout.addLayout(form)
+        card_layout.addSpacing(8)
 
         btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.login_btn = QPushButton('')
         self.register_btn = QPushButton('')
+        self.register_btn.setMinimumHeight(44)
+        
+        self.login_btn = QPushButton('')
         self.login_btn.setProperty('variant', 'primary')
-        btn_row.addWidget(self.login_btn)
+        self.login_btn.setMinimumHeight(44)
+        
         btn_row.addWidget(self.register_btn)
+        btn_row.addWidget(self.login_btn)
         card_layout.addLayout(btn_row)
 
+        card_layout.addSpacing(16)
         help_text = QLabel('')
         help_text.setWordWrap(True)
         help_text.setProperty('muted', True)
+        help_text.setAlignment(Qt.AlignCenter)
         card_layout.addWidget(help_text)
         self._help_label = help_text
 
         self.status_label = QLabel('')
         self.status_label.setProperty('muted', True)
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setMinimumHeight(24)
         root.addWidget(self.status_label)
         root.addStretch()
 

@@ -69,10 +69,10 @@ class AdminDialog(QDialog):
         list_card = QFrame()
         list_card.setProperty('card', True)
         list_layout = QVBoxLayout(list_card)
-        list_layout.setContentsMargins(12, 12, 12, 12)
-        list_layout.setSpacing(8)
+        list_layout.setContentsMargins(20, 20, 20, 20)
+        list_layout.setSpacing(12)
         self.member_list = QListWidget()
-        self.member_list.setSpacing(4)
+        self.member_list.setSpacing(8)
         list_layout.addWidget(self.member_list)
         root.addWidget(list_card, 1)
 

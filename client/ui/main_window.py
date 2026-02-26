@@ -102,11 +102,11 @@ class MainWindow(QMainWindow):
 
         left_panel = QFrame()
         left_panel.setProperty('sidebar', True)
-        left_panel.setMinimumWidth(300)
-        left_panel.setMaximumWidth(410)
+        left_panel.setMinimumWidth(320)
+        left_panel.setMaximumWidth(420)
         left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(20, 20, 20, 20)
-        left_layout.setSpacing(16)
+        left_layout.setContentsMargins(24, 28, 24, 24)
+        left_layout.setSpacing(20)
 
         user_header = QHBoxLayout()
         user_info = QVBoxLayout()
@@ -115,6 +115,7 @@ class MainWindow(QMainWindow):
         self.connection_label = QLabel('')
         self._set_connection_style(connected=False)
         user_info.addWidget(self.user_label)
+        user_info.addSpacing(2)
         user_info.addWidget(self.connection_label)
         
         self.settings_btn = QPushButton('⚙️')
@@ -138,7 +139,9 @@ class MainWindow(QMainWindow):
         self.rooms_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         
         left_layout.addLayout(user_header)
+        left_layout.addSpacing(4)
         left_layout.addWidget(self.search_input)
+        left_layout.addSpacing(4)
         left_layout.addWidget(inbox_title)
         left_layout.addWidget(self.rooms_list)
 
@@ -163,12 +166,13 @@ class MainWindow(QMainWindow):
 
         # Room Header
         room_header = QFrame()
-        room_header.setStyleSheet("background: #ffffff; border-bottom: 1px solid #e2e8f0;")
+        room_header.setStyleSheet("background: #ffffff; border-bottom: 1px solid #e2e8f0; border-top-right-radius: 12px;")
         room_header_layout = QHBoxLayout(room_header)
-        room_header_layout.setContentsMargins(24, 16, 24, 16)
+        room_header_layout.setContentsMargins(28, 22, 28, 22)
         
         self.room_title = QLabel('')
         self.room_title.setProperty('section', True)
+        self.room_title.setStyleSheet("font-size: 16pt;")
         self.room_meta = QLabel('')
         self.room_meta.setProperty('muted', True)
 
@@ -197,20 +201,20 @@ class MainWindow(QMainWindow):
         self.messages_list = QListWidget()
         self.messages_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.messages_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.messages_list.setSpacing(12)
-        self.messages_list.setStyleSheet("background: #f1f5f9; padding: 16px; border: none;")
+        self.messages_list.setSpacing(18)  # 메시지 간 여유
+        self.messages_list.setStyleSheet("background: #f8fafc; padding: 24px 32px; border: none;")
         self.messages_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.messages_list.verticalScrollBar().valueChanged.connect(self._on_messages_scrolled)
 
         compose_box = QFrame()
-        compose_box.setStyleSheet("background: #ffffff; border-top: 1px solid #e2e8f0;")
+        compose_box.setStyleSheet("background: #ffffff; border-top: 1px solid #e2e8f0; border-bottom-right-radius: 12px;")
         compose_box_layout = QVBoxLayout(compose_box)
-        compose_box_layout.setContentsMargins(20, 16, 20, 16)
+        compose_box_layout.setContentsMargins(24, 20, 24, 20)
         compose_box_layout.setSpacing(12)
 
         self.message_input = _ComposerTextEdit()
-        self.message_input.setFixedHeight(90)
-        self.message_input.setStyleSheet("border: none; background: transparent;")
+        self.message_input.setFixedHeight(94)
+        self.message_input.setStyleSheet("border: none; background: transparent; font-size: 11pt;")
         
         compose_meta = QHBoxLayout()
         self.compose_hint_label = QLabel('')
@@ -555,12 +559,12 @@ class MainWindow(QMainWindow):
         bubble = QFrame()
         bubble.setProperty('messageOwn', is_own)
         bubble_layout = QVBoxLayout(bubble)
-        bubble_layout.setContentsMargins(14, 10, 14, 10)
-        bubble_layout.setSpacing(4)
+        bubble_layout.setContentsMargins(16, 12, 16, 12)
+        bubble_layout.setSpacing(6)
 
         if not is_own:
             sender_label = QLabel(sender)
-            sender_label.setStyleSheet("color: #475569; font-weight: bold; font-size: 9.5pt;")
+            sender_label.setStyleSheet("color: #3b82f6; font-weight: 700; font-size: 9.5pt;")
             bubble_layout.addWidget(sender_label)
 
         if reply_content:
@@ -573,18 +577,19 @@ class MainWindow(QMainWindow):
                     preview=preview,
                 )
             )
-            reply.setStyleSheet("color: #64748b; font-size: 9pt; border-left: 2px solid #cbd5e1; padding-left: 6px;")
+            reply.setStyleSheet("color: #64748b; font-size: 9pt; border-left: 2.5px solid #cbd5e1; padding-left: 8px;")
             reply.setWordWrap(True)
             bubble_layout.addWidget(reply)
 
         body = QLabel(content)
         body.setWordWrap(True)
+        body.setStyleSheet("font-size: 10.5pt; line-height: 1.5;")
         body.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByKeyboard
             | Qt.TextInteractionFlag.TextSelectableByMouse
         )
         if self._contains_mention(content):
-            body.setStyleSheet('background: rgba(250, 204, 21, 0.18); border-radius: 6px; padding: 2px 4px;')
+            body.setStyleSheet('background: rgba(250, 204, 21, 0.25); border-radius: 6px; padding: 4px 6px; font-size: 10.5pt;')
         bubble_layout.addWidget(body)
 
         reaction_text = self._format_reactions(reactions)
