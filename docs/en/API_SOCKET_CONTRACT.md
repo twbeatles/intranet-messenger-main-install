@@ -196,6 +196,8 @@
 
 - if request includes `client_msg_id`, broadcast payload includes the same value
 - clients can match pending local messages with server-confirmed messages
+- `unread_count` is a compatibility field and can be `0` on performance-optimized paths
+  - authoritative unread state should be synced from room list API (`GET /api/rooms`)
 
 ## Socket Event Delivery Scope
 

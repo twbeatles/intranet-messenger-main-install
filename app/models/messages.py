@@ -8,6 +8,7 @@ import threading
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
 
 from app.models.base import get_db, safe_file_delete
@@ -29,6 +30,43 @@ server_stats = {
     'active_connections': 0
 }
 _stats_lock = threading.Lock()
+_fts5_probe_lock = threading.Lock()
+_fts5_probe_state = {'available': None, 'checked_at': 0.0}
+_FTS5_PROBE_TTL_SECONDS = 60.0
+_ws_split_re = re.compile(r'\s+')
+
+
+def _fts5_available(cursor) -> bool:
+    now = time.monotonic()
+    with _fts5_probe_lock:
+        cached = _fts5_probe_state.get('available')
+        checked_at = float(_fts5_probe_state.get('checked_at') or 0.0)
+        if cached is not None and (now - checked_at) < _FTS5_PROBE_TTL_SECONDS:
+            return bool(cached)
+
+    available = False
+    try:
+        cursor.execute("SELECT 1 FROM messages_fts LIMIT 1")
+        cursor.fetchone()
+        available = True
+    except Exception:
+        available = False
+
+    with _fts5_probe_lock:
+        _fts5_probe_state['available'] = bool(available)
+        _fts5_probe_state['checked_at'] = now
+    return available
+
+
+def _fts5_build_query(text: str | None) -> str | None:
+    raw = (text or '').strip()
+    if not raw:
+        return None
+    parts = [p for p in _ws_split_re.split(raw) if p]
+    if not parts:
+        return None
+    escaped = [p.replace('"', '""') for p in parts]
+    return ' AND '.join([f'"{token}"' for token in escaped])
 
 
 def update_server_stats(key, value=1, increment=True):
@@ -434,26 +472,9 @@ def search_messages(user_id, query, offset=0, limit=50):
         q = (query or '').strip()
         if not q:
             return {'messages': [], 'total': 0, 'offset': offset, 'limit': limit, 'has_more': False}
-
-        def _fts5_available():
-            try:
-                cursor.execute("SELECT 1 FROM messages_fts LIMIT 1")
-                cursor.fetchone()
-                return True
-            except Exception:
-                return False
-
-        def _fts5_build_query(text: str):
-            text = (text or '').strip()
-            if not text:
-                return None
-            parts = [p for p in re.split(r'\s+', text) if p]
-            parts = [p.replace('"', '""') for p in parts]
-            return ' AND '.join([f'"{p}"' for p in parts]) if parts else None
-
         fts_query = _fts5_build_query(q)
 
-        if fts_query and _fts5_available():
+        if fts_query and _fts5_available(cursor):
             cursor.execute('''
                 SELECT COUNT(*)
                 FROM messages_fts f
@@ -533,22 +554,6 @@ def advanced_search(user_id: int, query: str = None, room_id: int = None,
         def _like_escape(text: str) -> str:
             # Escape for SQLite LIKE with ESCAPE '\'
             return (text or '').replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-
-        def _fts5_available():
-            try:
-                cursor.execute("SELECT 1 FROM messages_fts LIMIT 1")
-                cursor.fetchone()
-                return True
-            except Exception:
-                return False
-
-        def _fts5_build_query(text: str):
-            text = (text or '').strip()
-            if not text:
-                return None
-            parts = [p for p in re.split(r'\s+', text) if p]
-            parts = [p.replace('"', '""') for p in parts]
-            return ' AND '.join([f'"{p}"' for p in parts]) if parts else None
 
         conditions = ['rm.user_id = ?']
         params = [user_id]
@@ -638,7 +643,7 @@ def advanced_search(user_id: int, query: str = None, room_id: int = None,
                 conditions.append('m.encrypted = 0')
 
                 fts_query = _fts5_build_query(query)
-                if fts_query and _fts5_available():
+                if fts_query and _fts5_available(cursor):
                     where_clause = ' AND '.join(conditions)
 
                     count_params = [fts_query] + params.copy()

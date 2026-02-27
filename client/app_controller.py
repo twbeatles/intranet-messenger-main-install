@@ -75,6 +75,10 @@ class MessengerAppController(QObject):
         self.current_server_url: str = self.default_server_url
         self.preferred_server_url: str = self.default_server_url
         self.rooms_cache: list[dict[str, Any]] = []
+        self._visible_rooms_signature: tuple[tuple[int, str, str, int, int, str], ...] | None = None
+        self._last_subscribed_room_ids: tuple[int, ...] = ()
+        self._remote_search_cache: dict[tuple[str, int], tuple[float, set[int]]] = {}
+        self._remote_search_cache_ttl_seconds = 5.0
         self.current_room_members: list[dict[str, Any]] = []
         self.current_admin_ids: set[int] = set()
         self.current_is_admin: bool = False
@@ -92,6 +96,11 @@ class MessengerAppController(QObject):
         self._typing_pending: bool | None = None
         self._typing_sent = False
         self._typing_room_id: int | None = None
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(300)
+        self._search_debounce_timer.timeout.connect(self._flush_search_request)
+        self._pending_search_query = ''
 
         self._pending_sends: dict[str, dict[str, Any]] = {}
         self._failed_send_ids: list[str] = []
@@ -274,7 +283,7 @@ class MessengerAppController(QObject):
         self.main_window.send_message_requested.connect(self._on_send_message_requested)
         self.main_window.send_file_requested.connect(self._on_send_file_requested)
         self.main_window.logout_requested.connect(self._logout)
-        self.main_window.search_requested.connect(self._on_search_requested)
+        self.main_window.search_requested.connect(self._on_search_input_changed)
         self.main_window.open_settings_requested.connect(self._open_settings)
         self.main_window.create_room_requested.connect(self._create_room)
         self.main_window.invite_members_requested.connect(self._invite_members)
@@ -489,14 +498,84 @@ class MessengerAppController(QObject):
         try:
             rooms = self.api.get_rooms(include_members=False)
             self.rooms_cache = rooms
-            self.main_window.set_rooms(rooms)
-            self.socket.subscribe_rooms([int(r['id']) for r in rooms if 'id' in r])
+            self._clear_remote_search_cache()
+            self._set_rooms_view(rooms)
+            self._sync_socket_room_subscriptions(rooms)
         except Exception as exc:
             self.main_window.show_error(str(exc))
 
     def _schedule_rooms_reload(self, delay_ms: int = 250) -> None:
         self._rooms_reload_timer.setInterval(max(100, int(delay_ms)))
         self._rooms_reload_timer.start()
+
+    @staticmethod
+    def _normalize_room_ids(rooms: list[dict[str, Any]]) -> tuple[int, ...]:
+        ids: set[int] = set()
+        for room in rooms:
+            try:
+                room_id = int(room.get('id') or 0)
+            except (TypeError, ValueError):
+                room_id = 0
+            if room_id > 0:
+                ids.add(room_id)
+        return tuple(sorted(ids))
+
+    @staticmethod
+    def _build_rooms_signature(rooms: list[dict[str, Any]]) -> tuple[tuple[int, str, str, int, int, str], ...]:
+        signature: list[tuple[int, str, str, int, int, str]] = []
+        for room in rooms:
+            try:
+                room_id = int(room.get('id') or 0)
+            except (TypeError, ValueError):
+                room_id = 0
+            signature.append(
+                (
+                    room_id,
+                    str(room.get('name') or ''),
+                    str(room.get('last_message_time') or ''),
+                    int(room.get('unread_count') or 0),
+                    int(room.get('pinned') or 0),
+                    str(room.get('last_message_preview') or ''),
+                )
+            )
+        return tuple(signature)
+
+    def _set_rooms_view(self, rooms: list[dict[str, Any]], *, force: bool = False) -> bool:
+        signature = self._build_rooms_signature(rooms)
+        if not force and self._visible_rooms_signature == signature:
+            return False
+        self.main_window.set_rooms(rooms)
+        self._visible_rooms_signature = signature
+        return True
+
+    def _sync_socket_room_subscriptions(self, rooms: list[dict[str, Any]]) -> None:
+        room_ids = self._normalize_room_ids(rooms)
+        if room_ids == self._last_subscribed_room_ids:
+            return
+        self.socket.subscribe_rooms(list(room_ids))
+        self._last_subscribed_room_ids = room_ids
+
+    def _clear_remote_search_cache(self) -> None:
+        self._remote_search_cache.clear()
+
+    def _get_cached_remote_search_room_ids(self, query: str, room_id: int) -> set[int] | None:
+        key = (str(query or '').strip().lower(), int(room_id or 0))
+        if not key[0]:
+            return None
+        entry = self._remote_search_cache.get(key)
+        if not entry:
+            return None
+        cached_at, matched_ids = entry
+        if (time.time() - float(cached_at)) > float(self._remote_search_cache_ttl_seconds):
+            self._remote_search_cache.pop(key, None)
+            return None
+        return set(matched_ids)
+
+    def _store_cached_remote_search_room_ids(self, query: str, room_id: int, matched_ids: set[int]) -> None:
+        key = (str(query or '').strip().lower(), int(room_id or 0))
+        if not key[0]:
+            return
+        self._remote_search_cache[key] = (time.time(), set(matched_ids))
 
     def _on_room_selected(self, room_id: int) -> None:
         if self._typing_sent and self._typing_room_id:
@@ -812,7 +891,7 @@ class MessengerAppController(QObject):
                 t('app.name', 'Intranet Messenger'),
                 t('tray.new_message', '{sender}: New message', sender=str(sender)),
             )
-        self.main_window.set_rooms(self.rooms_cache)
+        self._set_rooms_view(self.rooms_cache)
 
     def _extract_room_id(self, payload: dict[str, Any]) -> int | None:
         value = payload.get('room_id')
@@ -831,7 +910,7 @@ class MessengerAppController(QObject):
             if new_name:
                 self.main_window.set_room_title(new_name)
         self._update_room_cache_name(room_id, str(payload.get('name') or ''))
-        self.main_window.set_rooms(self.rooms_cache)
+        self._set_rooms_view(self.rooms_cache)
 
     def _on_socket_room_updated(self, payload: dict[str, Any]) -> None:
         action = str(payload.get('action') or '').strip().lower()
@@ -876,6 +955,10 @@ class MessengerAppController(QObject):
             and affected_user_id > 0
             and affected_user_id == current_user_id
         ):
+            try:
+                self.socket.leave_room(room_id)
+            except Exception:
+                pass
             self.current_room_id = None
             self.current_room_key = ''
             self.current_room_members = []
@@ -891,7 +974,7 @@ class MessengerAppController(QObject):
         room_id = self._extract_room_id(payload)
         if room_id and self.current_room_id == room_id:
             self._set_room_unread(room_id, 0)
-            self.main_window.set_rooms(self.rooms_cache)
+            self._set_rooms_view(self.rooms_cache)
 
     def _on_socket_user_typing(self, payload: dict[str, Any]) -> None:
         room_id = self._extract_room_id(payload)
@@ -1034,10 +1117,17 @@ class MessengerAppController(QObject):
         )
         self.main_window.show_error(str(message))
 
+    def _on_search_input_changed(self, query: str) -> None:
+        self._pending_search_query = str(query or '')
+        self._search_debounce_timer.start(300)
+
+    def _flush_search_request(self) -> None:
+        self._on_search_requested(self._pending_search_query)
+
     def _on_search_requested(self, query: str) -> None:
         query = query.strip()
         if not query:
-            self.main_window.set_rooms(self.rooms_cache)
+            self._set_rooms_view(self.rooms_cache)
             return
         lowered = query.lower()
         filtered = [
@@ -1047,26 +1137,34 @@ class MessengerAppController(QObject):
             or lowered in str(room.get('last_message_preview', '')).lower()
         ]
         if filtered:
-            self.main_window.set_rooms(filtered)
+            self._set_rooms_view(filtered)
             return
 
         if len(query) < 2:
-            self.main_window.set_rooms([])
+            self._set_rooms_view([])
             return
 
         try:
-            results = self.api.search_messages(query, int(self.current_room_id) if self.current_room_id else None)
-            matched_room_ids = {
-                int(row.get('room_id') or 0)
-                for row in results
-                if isinstance(row, dict) and int(row.get('room_id') or 0) > 0
-            }
+            scoped_room_id = int(self.current_room_id) if self.current_room_id else 0
+            matched_room_ids = self._get_cached_remote_search_room_ids(query, scoped_room_id)
+            if matched_room_ids is None:
+                results = self.api.search_messages(
+                    query,
+                    int(self.current_room_id) if self.current_room_id else None,
+                    limit=20,
+                )
+                matched_room_ids = {
+                    int(row.get('room_id') or 0)
+                    for row in results
+                    if isinstance(row, dict) and int(row.get('room_id') or 0) > 0
+                }
+                self._store_cached_remote_search_room_ids(query, scoped_room_id, matched_room_ids)
             remote_filtered = [
                 room for room in self.rooms_cache if int(room.get('id') or 0) in matched_room_ids
             ]
-            self.main_window.set_rooms(remote_filtered)
+            self._set_rooms_view(remote_filtered)
         except Exception:
-            self.main_window.set_rooms([])
+            self._set_rooms_view([])
 
     @staticmethod
     def _guess_message_type(file_name: str, from_server: str | None = None) -> str:
@@ -1215,6 +1313,7 @@ class MessengerAppController(QObject):
             return
         try:
             self.api.leave_room(room_id)
+            self.socket.leave_room(room_id)
             self.current_room_id = None
             self.current_room_key = ''
             self.current_room_members = []
@@ -1259,7 +1358,7 @@ class MessengerAppController(QObject):
             self.api.update_room_name(room_id, normalized)
             self._update_room_cache_name(room_id, normalized)
             self.main_window.set_room_title(normalized)
-            self.main_window.set_rooms(self.rooms_cache)
+            self._set_rooms_view(self.rooms_cache)
         except Exception as exc:
             self.main_window.show_error(str(exc))
 
@@ -1535,6 +1634,7 @@ class MessengerAppController(QObject):
     def _logout(self) -> None:
         self._rooms_reload_timer.stop()
         self._typing_debounce_timer.stop()
+        self._search_debounce_timer.stop()
         self._pending_send_timer.stop()
         self._session_refresh_timer.stop()
         try:
@@ -1558,6 +1658,9 @@ class MessengerAppController(QObject):
         self.current_room_id = None
         self.current_room_key = ''
         self.current_device_token = ''
+        self._visible_rooms_signature = None
+        self._last_subscribed_room_ids = ()
+        self._clear_remote_search_cache()
         self._remember_device = False
         self._session_expires_at_epoch = 0.0
         self._session_ttl_seconds = 0.0
@@ -1582,6 +1685,7 @@ class MessengerAppController(QObject):
 
     def _quit(self) -> None:
         self._typing_debounce_timer.stop()
+        self._search_debounce_timer.stop()
         self._pending_send_timer.stop()
         self._session_refresh_timer.stop()
         try:

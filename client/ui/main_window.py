@@ -83,6 +83,8 @@ class MainWindow(QMainWindow):
         self._history_loading = False
         self._history_scroll_blocked = False
         self._history_banner_key = '__history_banner__'
+        self._message_row_by_id: dict[int, int] = {}
+        self._message_row_index_dirty = False
         self._delivery_state = 'idle'
         self._delivery_count = 0
         self._build_ui()
@@ -338,6 +340,7 @@ class MainWindow(QMainWindow):
     def set_messages(self, messages: list[dict[str, Any]], has_more: bool = False) -> None:
         self._history_scroll_blocked = True
         self.messages_list.clear()
+        self._clear_message_row_index()
         self._history_has_more = bool(has_more)
         self._history_loading = False
 
@@ -356,6 +359,7 @@ class MainWindow(QMainWindow):
 
         for message in messages:
             self._append_message_item(message)
+        self._rebuild_message_row_index()
         self._update_history_banner()
         self.messages_list.scrollToBottom()
         self._history_scroll_blocked = False
@@ -388,6 +392,7 @@ class MainWindow(QMainWindow):
         while self.messages_list.count() > self._max_rendered_messages + (1 if self._has_history_banner() else 0):
             self.messages_list.takeItem(self.messages_list.count() - 1)
 
+        self._rebuild_message_row_index()
         self._update_history_banner()
 
         new_max = scrollbar.maximum()
@@ -400,10 +405,22 @@ class MainWindow(QMainWindow):
             first_item = self.messages_list.item(0)
             if first_item and str(first_item.data(Qt.ItemDataRole.UserRole) or '') == '__placeholder__':
                 self.messages_list.clear()
+                self._clear_message_row_index()
         self._append_message_item(message)
+        trimmed = False
         while self.messages_list.count() > self._max_rendered_messages + (1 if self._has_history_banner() else 0):
             remove_index = 1 if self._has_history_banner() else 0
             self.messages_list.takeItem(remove_index)
+            trimmed = True
+        if trimmed:
+            self._rebuild_message_row_index()
+        else:
+            try:
+                message_id = int((message or {}).get('id') or 0)
+            except (TypeError, ValueError):
+                message_id = 0
+            if message_id > 0:
+                self._message_row_by_id[message_id] = self.messages_list.count() - 1
         self.messages_list.scrollToBottom()
 
     def show_error(self, message: str) -> None:
@@ -529,8 +546,12 @@ class MainWindow(QMainWindow):
         if at_top:
             insert_row = 1 if self._has_history_banner() else 0
             self.messages_list.insertItem(insert_row, item)
+            if message_id > 0:
+                self._message_row_index_dirty = True
         else:
             self.messages_list.addItem(item)
+            if message_id > 0:
+                self._message_row_by_id[message_id] = self.messages_list.count() - 1
         self.messages_list.setItemWidget(item, container)
 
     def _build_message_container(self, message: dict[str, Any]) -> QWidget:
@@ -629,18 +650,28 @@ class MainWindow(QMainWindow):
     def _find_message_row(self, message_id: int) -> int:
         if message_id <= 0:
             return -1
+        if self._message_row_index_dirty:
+            self._rebuild_message_row_index()
+        return int(self._message_row_by_id.get(int(message_id), -1))
+
+    def _clear_message_row_index(self) -> None:
+        self._message_row_by_id.clear()
+        self._message_row_index_dirty = False
+
+    def _rebuild_message_row_index(self) -> None:
+        self._message_row_by_id.clear()
         start = 1 if self._has_history_banner() else 0
         for row in range(start, self.messages_list.count()):
             item = self.messages_list.item(row)
             if not item:
                 continue
             try:
-                current_id = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+                message_id = int(item.data(Qt.ItemDataRole.UserRole) or 0)
             except (TypeError, ValueError):
-                current_id = 0
-            if current_id == message_id:
-                return row
-        return -1
+                message_id = 0
+            if message_id > 0:
+                self._message_row_by_id[message_id] = row
+        self._message_row_index_dirty = False
 
     def _replace_message_item(self, row: int, message: dict[str, Any]) -> bool:
         if row < 0 or row >= self.messages_list.count():
@@ -747,6 +778,7 @@ class MainWindow(QMainWindow):
         banner.setFlags(Qt.ItemFlag.NoItemFlags)
         banner.setData(Qt.ItemDataRole.UserRole, self._history_banner_key)
         self.messages_list.insertItem(0, banner)
+        self._message_row_index_dirty = True
 
     def _update_history_banner(self) -> None:
         if self._history_has_more and not self._has_history_banner():

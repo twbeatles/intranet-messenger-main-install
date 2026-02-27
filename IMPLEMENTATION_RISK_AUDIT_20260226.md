@@ -1,4 +1,4 @@
-﻿# 기능 구현 리스크 및 추가 과제 점검 보고서 (2026-02-26)
+# 기능 구현 리스크 및 추가 과제 점검 보고서 (2026-02-26)
 
 ## 0) 점검 범위와 기준
 
@@ -12,135 +12,75 @@
 - 목적
   - 기능 구현 관점에서 잠재 장애/권한 누수/운영 리스크를 재점검하고, 즉시 반영 가능한 보강 과제를 우선순위화
 
-## 1) 실행 검증 결과 (이번 점검 세션)
+## 1) 실행 검증 결과 (2026-02-27 재검증)
 
 ### 1.1 테스트 실행 상태
 
 - 실행 명령: `pytest tests -q`
-- 결과: **수집 단계에서 실패(3 errors)**
-- 공통 원인: `flask_compress` import 시 `brotli`/`brotlicffi` 미설치로 `ModuleNotFoundError`
+- 결과: **160 passed (0:02:38)**
 
-### 1.2 재현 명령
+### 1.2 핵심 시나리오 재검증
 
-- 실행 명령: `python -c "import flask_compress; print('ok')"`
-- 결과: `ModuleNotFoundError: No module named 'brotli'`
+- 압축 fallback: `tests/test_compress_fallback.py`
+- 강퇴/퇴장 직후 소켓 차단: `tests/test_socket_membership_unsubscribe.py`
+- 프로필 이미지 원자성/고아 정리: `tests/test_profile_image_atomicity.py`
+- 검색 debounce: `tests/test_client_search_debounce.py`
+- 고급 검색 방어선: `tests/test_advanced_search_guards.py`
+- 세션 가드 민감 경로 fail-closed: `tests/test_session_guard_fail_open_flag.py`
 
-## 2) 확정/유력 리스크
+## 2) 리스크별 상태 (R1~R6)
 
-### R1. [Critical] 클린 환경에서 서버/테스트 기동 실패 가능 (의존성 누락)
+| ID | 상태 | 검증근거 | 검증일 | 잔여 액션 |
+|---|---|---|---|---|
+| R1 | 완료 | `requirements.txt`에 `brotli` 추가, `app/extensions.py`에 `flask_compress` import 실패 fallback 추가, `tests/test_compress_fallback.py` 통과 | 2026-02-27 | 없음 |
+| R2 | 완료 | `app/sockets.py` `force_remove_user_from_room`, `app/routes.py` leave/kick 성공 경로 강제 unsubscribe, `client/services/socket_client.py` `leave_room`, `client/app_controller.py` self-kick/self-leave 즉시 leave emit, `tests/test_socket_membership_unsubscribe.py` 통과 | 2026-02-27 | 없음 |
+| R3 | 완료 | `app/routes.py` 프로필 이미지 저장/DB 반영/기존파일 삭제 순서 보강 + 실패 시 신규 파일 롤백, `app/upload_tokens.py` `cleanup_orphan_profile_files` 추가, `app/models/base.py` 유지보수 루프 통합, `tests/test_profile_image_atomicity.py` 통과 | 2026-02-27 | 없음 |
+| R4 | 완료 | `client/app_controller.py` 검색 입력 300ms debounce (`_on_search_input_changed`, `_flush_search_request`) 적용, `tests/test_client_search_debounce.py` 통과 | 2026-02-27 | 없음 |
+| R5 | 완료 | `app/routes.py` `/api/search/advanced`에 `@limiter.limit("30 per minute")` 및 query/date/id/file_only/limit/offset 검증 추가, `tests/test_advanced_search_guards.py`(400/200/429) 통과 | 2026-02-27 | 없음 |
+| R6 | 부분 | `app/__init__.py` 민감 경로 강제 fail-closed + `fail_closed_count/last_fail_closed_at` 통계 추가, `app/routes.py` `/api/system/health` 확장 필드 반영, `tests/test_session_guard_fail_open_flag.py`, `tests/test_system_health_api.py` 통과 | 2026-02-27 | 운영 정책(전역 fail-closed 전환 여부) 최종 결정 필요 |
 
-- 근거
-  - `requirements.txt:20`에 `Flask-Compress`만 명시되어 있고 `brotli`/`brotlicffi`가 없음
-  - `app/extensions.py:5`에서 `from flask_compress import Compress`를 모듈 import 시점에 즉시 수행
-- 영향
-  - `README.md`의 빠른 시작(`pip install -r requirements.txt`)만으로는 서버 및 테스트가 즉시 기동되지 않을 수 있음
-  - CI/신규 개발 환경에서 초기 세팅 실패 확률 높음
-- 권고
-  - `requirements.txt`에 `brotli` 또는 `brotlicffi` 명시 추가
-  - 보조적으로 `app/extensions.py`에서 압축 확장 import 실패 시 graceful fallback 처리
+## 3) 요약
 
----
+- 감사 문서 기준 미완료 핵심 항목 R1~R5는 코드/테스트로 완료 처리했습니다.
+- 선택 정책 R6(민감 경로 fail-closed)도 코드/테스트 반영 완료했으나, 전역 정책 전환은 운영 의사결정이 남아 `부분`으로 유지합니다.
+- 최종 상태는 전체 회귀(`pytest tests -q`) 결과와 일치하도록 확정했습니다.
 
-### R2. [High] 강퇴/퇴장 직후 소켓 room 구독이 해제되지 않아 메시지 수신이 지속될 가능성
+## 4) 성능 최적화 리팩토링 반영 (2026-02-27)
 
-- 근거 (정적 분석)
-  - 서버 연결 시 사용자의 모든 room에 `join_room` 수행: `app/sockets.py:143`~`149`
-  - 메시지 송신 시 room 브로드캐스트: `app/sockets.py:414`
-  - 강퇴/퇴장 API는 DB 멤버십만 변경하고 대상 SID를 room에서 강제 `leave`하지 않음: `app/routes.py:722`~`809`
-  - 클라이언트는 본인 강퇴/퇴장 이벤트 수신 시 UI 상태만 정리하고 `leave_room` emit을 호출하지 않음: `client/app_controller.py:694`~`707`
-  - 소켓 클라이언트 래퍼에 `leave_room` 메서드 자체가 없음: `client/services/socket_client.py`
-- 영향
-  - 멤버십이 제거된 사용자가 재연결 전까지 해당 room의 `new_message`를 계속 수신할 가능성
-  - 권한 모델과 실시간 이벤트 전파 사이의 보안 경계 불일치
-- 권고
-  - 서버에서 강퇴/퇴장 시 대상 사용자의 활성 SID들을 `room_{id}`에서 강제 제거
-  - 클라이언트에도 방어적으로 `leave_room` API를 추가해 self-removal 수신 시 즉시 탈퇴 emit
-  - 회귀 테스트 추가: “강퇴/퇴장 직후 해당 사용자에게 `new_message` 미수신” 검증
+### 4.1 문서 기준 참조
 
----
+- `docs/ko/ARCHITECTURE.md`
+  - 데스크톱 신뢰성 계층의 debounce/증분 동기화 원칙
+- `docs/ko/OPERATIONS_RUNBOOK.md`
+  - 대용량 방/장기 운영 성능 점검 항목
 
-### R3. [Medium] 프로필 이미지 업데이트 비원자성으로 데이터 손실/고아 파일 가능
+### 4.2 클라이언트 최적화
 
-- 근거
-  - 기존 프로필 이미지를 먼저 삭제: `app/routes.py:1182`~`1191`
-  - 새 파일 저장 후 DB 반영 시도: `app/routes.py:1194`~`1205`
-  - DB 업데이트 실패 시 새 파일 정리/기존 파일 복구 로직 없음
-  - 고아 파일 정리 로직은 `profiles` 폴더를 제외: `app/upload_tokens.py:373`~`376`
-- 영향
-  - DB 갱신 실패 시 사용자 입장에서 기존 프로필이 사라지고, 새 파일이 디스크에 잔류할 수 있음
-- 권고
-  - 새 파일 임시 저장 -> DB 반영 성공 후 기존 파일 삭제 순서로 트랜잭션 유사 흐름 적용
-  - 실패 시 새 파일 즉시 정리
-  - 프로필 폴더 전용 orphan 정리 배치(보수적 grace time) 추가
+- `client/app_controller.py`
+  - 방 목록 렌더 dedupe(`_set_rooms_view`) 도입
+  - 소켓 `subscribe_rooms` dedupe(`_sync_socket_room_subscriptions`) 도입
+  - 원격 검색 결과 단기 캐시(기본 5초) 도입으로 동일 질의 재호출 억제
+- `client/services/api_client.py`
+  - 사이드바 검색 API 기본 `limit=20` 적용(기존 기본 50 대비 페이로드/쿼리 부담 축소)
+- `client/ui/main_window.py`
+  - 메시지 ID -> row 인덱스 도입으로 `reaction_updated`/`message_edited`/`message_deleted` 갱신 시 선형 탐색 비용 축소
 
----
+### 4.3 서버 최적화
 
-### R4. [Medium] 검색 UX에서 서버 레이트 리밋(30/min) 초과 가능성
+- `app/sockets.py`
+  - 사용자 방 멤버십 집합 캐시(`get_user_room_id_set`) 및 빠른 접근 체크(`user_has_room_access`) 도입
+  - `subscribe_rooms`/`join_room`/`send_message`/`typing` 핫패스에서 캐시 우선 검증 적용
+  - `send_message` 핫패스의 메시지당 unread COUNT 쿼리를 제거하고 호환 필드는 유지(`unread_count=0`)
+- `app/models/messages.py`
+  - FTS 가용성 probe 결과 캐시(60초 TTL) 도입
+  - FTS query builder 정적 헬퍼화로 중복 파싱/프로브 비용 축소
 
-- 근거
-  - 입력 변경마다 즉시 검색 이벤트 발생: `client/ui/main_window.py:265`
-  - 로컬 매칭 실패 시 키 입력 단위로 서버 검색 호출: `client/app_controller.py:860`~`892`
-  - 서버 `/api/search` 레이트 리밋: `app/routes.py:934` (`30 per minute`)
-- 영향
-  - 빠른 타이핑/지우기 반복 시 429 응답 유발 가능
-  - 사용자에게 결과 목록 빈 화면/깜빡임으로 체감될 수 있음
-- 권고
-  - 클라이언트 원격 검색 debounce(250~400ms) + in-flight 요청 취소/무시
-  - Enter 제출 기반 검색 옵션 또는 최소 글자수 상향(예: 3자)
+### 4.4 검증 결과
 
----
-
-### R5. [Medium] `/api/search/advanced` 운영 방어선이 `/api/search` 대비 약함
-
-- 근거
-  - 라우트에 레이트 리밋 데코레이터 없음: `app/routes.py:1604`~`1618`
-  - 검색 파라미터 길이/형식 제한(날짜, query 길이 등) 정책이 `/api/search`보다 느슨함
-- 영향
-  - 고급 검색 경로를 통한 과도한 DB 부하 유입 가능성
-  - 일반 검색과의 정책 일관성 저하
-- 권고
-  - `/api/search/advanced`에도 limiter 적용
-  - `query` 길이, `date_from/date_to` 형식, `room_id/sender_id` 타입 검증 추가
-
----
-
-### R6. [Low, 정책 리스크] 세션 토큰 가드 예외 시 fail-open
-
-- 근거
-  - 세션 토큰 검증 중 예외 발생 시 요청을 통과시킴: `app/__init__.py:289`~`291`
-- 영향
-  - DB 장애/일시 에러 시 만료/무효 세션 차단이 느슨해질 수 있음
-- 권고
-  - 최소한 민감 API(`메시지 전송/파일 다운로드/계정변경`)는 fail-closed 또는 제한 모드로 분기
-  - 예외 발생량 모니터링 지표 추가
-
-## 3) 우선순위 실행 제안
-
-### P0 (즉시)
-
-1. R1 해결: `brotli` 계열 의존성 명시 및 CI 환경에서 재검증
-2. R2 해결: 강퇴/퇴장 직후 서버 강제 room unsubscribe 구현 + 회귀 테스트 추가
-
-### P1 (단기)
-
-1. R3 해결: 프로필 이미지 교체 플로우 원자성 보강
-2. R4 해결: 검색 입력 debounce/스로틀 적용
-3. R5 해결: 고급 검색 라우트 방어선(레이트 리밋/입력 검증) 정렬
-
-### P2 (중기)
-
-1. R6 정책 결정: fail-open 유지 여부 확정 및 운영 경보 체계 보강
-
-## 4) 다음 구현 턴 권장 테스트 추가
-
-- `test_bootstrap_requires_compression_dependency_or_fallback`
-- `test_kicked_user_does_not_receive_room_new_message_after_membership_removal`
-- `test_profile_image_update_rollback_on_db_failure`
-- `test_search_ui_debounce_prevents_rate_limit_burst` (클라이언트 통합/시뮬레이션)
-- `test_advanced_search_has_rate_limit_and_input_validation`
-
-## 5) 요약
-
-- 이번 점검에서 가장 시급한 항목은 **환경 기동 실패(R1)** 와 **실시간 권한 경계 누수 가능성(R2)** 입니다.
-- `claude.md`에 명시된 “계약을 깨지 않기” 관점에서 보면, 특히 R2는 API 멤버십 상태와 소켓 room 상태의 불일치 문제라 우선 보완이 필요합니다.
-- 이번 문서는 코드 변경 없이 점검 결과만 기록했으며, 실제 수정 턴에서는 P0부터 회귀 테스트와 함께 반영하는 것을 권장합니다.
+- 신규/수정 테스트:
+  - `tests/test_client_rooms_performance.py`
+  - `tests/test_client_search_api_limit.py`
+  - `tests/test_messages_fts_probe_cache.py`
+  - `tests/test_socket_room_access_cache.py`
+- 전체 회귀:
+  - `pytest tests -q` -> **160 passed** (2026-02-27)

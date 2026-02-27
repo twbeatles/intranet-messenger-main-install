@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 프로젝트: `intranet-messenger-main-install`  
-최종 업데이트: 2026-02-26
+최종 업데이트: 2026-02-27
 
 ## 1) 목적
 
@@ -28,9 +28,9 @@
 
 - 제품 방향: Desktop-First (Windows 설치형 클라이언트 중심)
 - 아키텍처: `Flask + Socket.IO + SQLite` 서버 + `PySide6` 클라이언트
-- 최신 검증(2026-02-26):
-  - `pytest tests -q` -> `136 passed`
-  - `pytest --maxfail=1` -> `136 passed`
+- 최신 검증(2026-02-27):
+  - `pytest tests -q` -> `160 passed`
+  - `pytest --maxfail=1` -> `160 passed`
 - i18n 적용 기준:
   - 기본 로케일: `ko-KR`
   - 지원 로케일: `en-US`

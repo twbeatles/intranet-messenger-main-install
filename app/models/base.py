@@ -150,6 +150,7 @@ def run_maintenance_once() -> dict:
         'cleaned_device_sessions': 0,
         'cleaned_upload_tokens': 0,
         'cleaned_orphan_uploads': 0,
+        'cleaned_orphan_profiles': 0,
     }
     try:
         results['closed_polls'] = int(close_expired_polls() or 0)
@@ -170,10 +171,15 @@ def run_maintenance_once() -> dict:
     except Exception as e:
         logger.warning(f"Maintenance cleanup_stale_device_sessions error: {e}")
     try:
-        from app.upload_tokens import purge_expired_upload_tokens, cleanup_orphan_upload_files
+        from app.upload_tokens import (
+            purge_expired_upload_tokens,
+            cleanup_orphan_upload_files,
+            cleanup_orphan_profile_files,
+        )
 
         results['cleaned_upload_tokens'] = int(purge_expired_upload_tokens() or 0)
         results['cleaned_orphan_uploads'] = int(cleanup_orphan_upload_files() or 0)
+        results['cleaned_orphan_profiles'] = int(cleanup_orphan_profile_files() or 0)
     except Exception as e:
         logger.warning(f"Maintenance upload cleanup error: {e}")
 

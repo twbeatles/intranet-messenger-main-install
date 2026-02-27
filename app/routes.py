@@ -156,6 +156,18 @@ def register_routes(app):
         # Backward-compatible fallback.
         if not emitted and broadcast:
             socketio_instance.emit(event, body)
+
+    def _force_unsubscribe_user_from_room(user_id: int, room_id: int) -> int:
+        """
+        Remove all active sockets of user from room immediately.
+        This closes the timing gap between DB membership update and socket room state.
+        """
+        try:
+            from app.sockets import force_remove_user_from_room
+
+            return int(force_remove_user_from_room(int(user_id), int(room_id)) or 0)
+        except Exception:
+            return 0
     
     @app.route('/')
     def index():
@@ -579,7 +591,12 @@ def register_routes(app):
 
             guard_stats = get_session_guard_stats()
         except Exception:
-            guard_stats = {'fail_open_count': 0, 'last_fail_open_at': None}
+            guard_stats = {
+                'fail_open_count': 0,
+                'last_fail_open_at': None,
+                'fail_closed_count': 0,
+                'last_fail_closed_at': None,
+            }
 
         tls_effective = (os.environ.get('MESSENGER_TLS_EFFECTIVE') or '').strip() == '1'
         if not tls_effective:
@@ -600,6 +617,8 @@ def register_routes(app):
                 'fail_open_enabled': bool(app.config.get('SESSION_TOKEN_FAIL_OPEN', True)),
                 'fail_open_count': int(guard_stats.get('fail_open_count') or 0),
                 'last_fail_open_at': guard_stats.get('last_fail_open_at'),
+                'fail_closed_count': int(guard_stats.get('fail_closed_count') or 0),
+                'last_fail_closed_at': guard_stats.get('last_fail_closed_at'),
             },
             'maintenance': get_maintenance_status(),
             'rate_limit': {
@@ -890,6 +909,7 @@ def register_routes(app):
         success = leave_room_db(room_id, left_user_id)
         if not success:
             return jsonify({'error': '대화방 나가기에 실패했습니다.'}), 400
+        _force_unsubscribe_user_from_room(left_user_id, room_id)
 
         _emit_socket_event(
             'room_members_updated',
@@ -942,6 +962,7 @@ def register_routes(app):
         success = leave_room_db(room_id, target_user_id)
         if not success:
             return jsonify({'error': '강퇴 처리에 실패했습니다.'}), 400
+        _force_unsubscribe_user_from_room(int(target_user_id), room_id)
 
         actor_id = int(session['user_id'])
         _emit_socket_event(
@@ -1354,32 +1375,32 @@ def register_routes(app):
         # 프로필 이미지 폴더 생성
         profile_folder = os.path.join(upload_folder, 'profiles')
         os.makedirs(profile_folder, exist_ok=True)
-        
-        # [v4.12] 기존 프로필 이미지 삭제 (디스크 공간 절약)
+
         user = get_user_by_id(session['user_id'])
-        if user and user.get('profile_image'):
-            try:
-                old_image_path = os.path.join(upload_folder, user['profile_image'])
-                # [v4.14] safe_file_delete 사용
-                if safe_file_delete(old_image_path):
-                    logger.debug(f"Old profile image deleted: {user['profile_image']}")
-            except Exception as e:
-                logger.warning(f"Old profile image deletion failed: {e}")
-        
+        old_profile_image = str((user or {}).get('profile_image') or '').strip()
+
         # 파일 저장 - [v4.14] UUID 추가로 동시 업로드 시 파일명 충돌 방지
         filename = f"{session['user_id']}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}.{ext}"
         file_path = os.path.join(profile_folder, filename)
         file.save(file_path)
-        
-        # DB 업데이트
+
+        # DB 업데이트 성공 이후에만 기존 파일 삭제 (원자성 보강)
+        profile_image = f"profiles/{filename}"
         try:
-            profile_image = f"profiles/{filename}"
             success = update_user_profile(session['user_id'], profile_image=profile_image)
-            
             if success:
+                if old_profile_image:
+                    try:
+                        old_image_path = os.path.join(upload_folder, old_profile_image)
+                        if safe_file_delete(old_image_path):
+                            logger.debug(f"Old profile image deleted: {old_profile_image}")
+                    except Exception as e:
+                        logger.warning(f"Old profile image deletion failed: {e}")
                 return jsonify({'success': True, 'profile_image': profile_image})
+            safe_file_delete(file_path)
             return jsonify({'error': '프로필 이미지 데이터베이스 업데이트 실패'}), 500
         except Exception as e:
+            safe_file_delete(file_path)
             logger.error(f"Profile update error: {e}")
             return jsonify({'error': '프로필 처리 중 오류가 발생했습니다.'}), 500
     
@@ -1778,19 +1799,95 @@ def register_routes(app):
     # 고급 검색 API
     # ============================================================================
     @app.route('/api/search/advanced', methods=['POST'])
+    @limiter.limit("30 per minute")
     def advanced_search_route():
         if 'user_id' not in session:
             return jsonify({'error': '로그인이 필요합니다.'}), 401
-        
+
         data = _json_dict()
+        query = data.get('query')
+        if query is None:
+            normalized_query = None
+        elif isinstance(query, str):
+            normalized_query = query.strip()
+            if len(normalized_query) > 200:
+                return jsonify({'error': 'query 길이가 너무 깁니다.'}), 400
+            if not normalized_query:
+                normalized_query = None
+        else:
+            return jsonify({'error': 'query는 문자열이어야 합니다.'}), 400
+
+        def _parse_positive_int(name: str):
+            value = data.get(name)
+            if value is None or value == '':
+                return None
+            try:
+                normalized = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f'{name}는 정수여야 합니다.')
+            if normalized <= 0:
+                raise ValueError(f'{name}는 1 이상의 정수여야 합니다.')
+            return normalized
+
+        try:
+            room_id = _parse_positive_int('room_id')
+            sender_id = _parse_positive_int('sender_id')
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+
+        def _parse_date(name: str):
+            value = data.get(name)
+            if value is None or value == '':
+                return None
+            if not isinstance(value, str):
+                raise ValueError(f'{name}는 YYYY-MM-DD 형식 문자열이어야 합니다.')
+            normalized = value.strip()
+            try:
+                datetime.strptime(normalized, '%Y-%m-%d')
+            except ValueError:
+                raise ValueError(f'{name} 형식이 올바르지 않습니다. YYYY-MM-DD를 사용하세요.')
+            return normalized
+
+        try:
+            date_from = _parse_date('date_from')
+            date_to = _parse_date('date_to')
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+
+        raw_file_only = data.get('file_only', False)
+        if isinstance(raw_file_only, bool):
+            file_only = raw_file_only
+        elif isinstance(raw_file_only, str):
+            normalized_bool = raw_file_only.strip().lower()
+            if normalized_bool in ('1', 'true', 'yes', 'on'):
+                file_only = True
+            elif normalized_bool in ('0', 'false', 'no', 'off', ''):
+                file_only = False
+            else:
+                return jsonify({'error': 'file_only는 boolean 값이어야 합니다.'}), 400
+        else:
+            return jsonify({'error': 'file_only는 boolean 값이어야 합니다.'}), 400
+
+        raw_limit = data.get('limit', 50)
+        raw_offset = data.get('offset', 0)
+        try:
+            limit = int(raw_limit)
+            offset = int(raw_offset)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'limit/offset은 정수여야 합니다.'}), 400
+        limit = min(max(limit, 1), 200)
+        offset = max(offset, 0)
+
         results = advanced_search(
             user_id=session['user_id'],
-            query=data.get('query'),
-            room_id=data.get('room_id'),
-            sender_id=data.get('sender_id'),
-            date_from=data.get('date_from'),
-            date_to=data.get('date_to'),
-            file_only=data.get('file_only', False)
+            query=normalized_query,
+            room_id=room_id,
+            sender_id=sender_id,
+            date_from=date_from,
+            date_to=date_to,
+            file_only=file_only,
+            limit=limit,
+            offset=offset,
         )
         return jsonify(results)
 

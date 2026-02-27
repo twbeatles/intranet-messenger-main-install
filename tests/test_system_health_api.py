@@ -28,3 +28,5 @@ def test_system_health_shape(client):
     assert 'session_guard' in payload
     assert 'maintenance' in payload
     assert 'rate_limit' in payload
+    assert 'fail_closed_count' in payload['session_guard']
+    assert 'last_fail_closed_at' in payload['session_guard']

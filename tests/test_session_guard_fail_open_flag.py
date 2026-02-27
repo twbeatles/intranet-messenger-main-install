@@ -36,3 +36,17 @@ def test_session_guard_fail_closed_when_disabled(client, monkeypatch):
     monkeypatch.setattr(models, 'get_user_session_token', _boom)
     response = client.get('/api/rooms')
     assert response.status_code == 503
+
+
+def test_session_guard_sensitive_route_forces_fail_closed(client, monkeypatch):
+    _register_and_login(client, 'guard_sensitive')
+    client.application.config['SESSION_TOKEN_FAIL_OPEN'] = True
+
+    import app.models as models
+
+    def _boom(_user_id):
+        raise RuntimeError('db failure')
+
+    monkeypatch.setattr(models, 'get_user_session_token', _boom)
+    response = client.get('/api/profile')
+    assert response.status_code == 503

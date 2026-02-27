@@ -61,4 +61,6 @@ python -m client.main --server-url http://127.0.0.1:5000
   - 리액션 실시간 반영
   - 답장/멘션/코드블록 UX 강화
 - 대량 메시지 최적화:
-  - 점진 렌더링 + lazy decrypt 정책 세분화
+  - (반영) 증분 업데이트 인덱스(`message_id -> row`) 도입
+  - (반영) 방 목록 렌더/구독 dedupe + 검색 원격 결과 캐시 적용
+  - (잔여) 점진 렌더링 + lazy decrypt 정책 세분화

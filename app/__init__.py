@@ -118,6 +118,8 @@ socketio = None
 session_guard_stats = {
     'fail_open_count': 0,
     'last_fail_open_at': None,
+    'fail_closed_count': 0,
+    'last_fail_closed_at': None,
 }
 
 
@@ -125,6 +127,8 @@ def get_session_guard_stats() -> dict:
     return {
         'fail_open_count': int(session_guard_stats.get('fail_open_count') or 0),
         'last_fail_open_at': session_guard_stats.get('last_fail_open_at'),
+        'fail_closed_count': int(session_guard_stats.get('fail_closed_count') or 0),
+        'last_fail_closed_at': session_guard_stats.get('last_fail_closed_at'),
     }
 
 
@@ -360,6 +364,18 @@ def create_app():
         if path.startswith('/static/'):
             return None
 
+        def _is_sensitive_guard_request() -> bool:
+            method = str(request.method or 'GET').upper()
+            if path.startswith('/uploads/'):
+                return True
+            if path.startswith('/api/upload'):
+                return True
+            if path in ('/api/profile', '/api/profile/image', '/api/me/password'):
+                return True
+            if method in ('POST', 'PUT', 'PATCH', 'DELETE') and path.startswith('/api/'):
+                return True
+            return False
+
         try:
             from app.models import get_user_session_token
 
@@ -369,12 +385,27 @@ def create_app():
             if session.get('session_token') == current_token:
                 return None
         except Exception as e:
+            if _is_sensitive_guard_request():
+                session_guard_stats['fail_closed_count'] = int(session_guard_stats.get('fail_closed_count') or 0) + 1
+                session_guard_stats['last_fail_closed_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                logger.error(f"Session token guard fail-closed(sensitive): {e}")
+                session.clear()
+                return (
+                    json.dumps(
+                        {'error': '세션 검증 시스템 오류입니다. 잠시 후 다시 시도해주세요.'},
+                        ensure_ascii=False,
+                    ),
+                    503,
+                    {'Content-Type': 'application/json; charset=utf-8'},
+                )
             if bool(app.config.get('SESSION_TOKEN_FAIL_OPEN', True)):
                 # Default behavior: fail-open in case of transient DB error.
                 session_guard_stats['fail_open_count'] = int(session_guard_stats.get('fail_open_count') or 0) + 1
                 session_guard_stats['last_fail_open_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 logger.warning(f"Session token guard fail-open: {e}")
                 return None
+            session_guard_stats['fail_closed_count'] = int(session_guard_stats.get('fail_closed_count') or 0) + 1
+            session_guard_stats['last_fail_closed_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             logger.error(f"Session token guard fail-closed: {e}")
             session.clear()
             return (

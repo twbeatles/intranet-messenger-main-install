@@ -2,7 +2,23 @@
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_wtf.csrf import CSRFProtect
-from flask_compress import Compress
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    from flask_compress import Compress
+except Exception:
+    class Compress:  # type: ignore[no-redef]
+        """
+        Fallback no-op compression extension.
+        Keeps app bootable when optional compression backend deps are missing.
+        """
+
+        def init_app(self, app):
+            app.logger.warning("flask_compress unavailable; response compression disabled")
+            logger.warning("flask_compress unavailable; response compression disabled")
+            return None
 
 
 def _rate_limit_key():

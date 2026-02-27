@@ -116,6 +116,9 @@ class SocketClient:
     def join_room(self, room_id: int) -> None:
         self.emit('join_room', {'room_id': room_id})
 
+    def leave_room(self, room_id: int) -> None:
+        self.emit('leave_room', {'room_id': room_id})
+
     def subscribe_rooms(self, room_ids: list[int]) -> None:
         self.emit('subscribe_rooms', {'room_ids': room_ids})
 

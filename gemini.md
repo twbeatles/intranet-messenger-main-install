@@ -1,7 +1,7 @@
 # GEMINI.md
 
 프로젝트: `intranet-messenger-main-install`  
-최종 업데이트: 2026-02-26
+최종 업데이트: 2026-02-27
 
 ## 1) 이 문서의 역할
 
@@ -21,7 +21,7 @@ Gemini 기반 새 작업 세션이 시작될 때, 현재 프로젝트의 운영 
 - 현재 저장소에서는 `IMPLEMENTATION_RISK_AUDIT_20260224.md`, `IMPLEMENTATION_RISK_AUDIT_20260225.md`가 삭제 상태일 수 있음.
 - 본 세션 기준 정책: **복구하지 않고 삭제 상태를 유지**하며, 대체 기준 문서로 `OFFLINE_MESSENGER_IMPLEMENTATION_RISK_ROADMAP_20260226.md`를 사용.
 
-## 3) 프로젝트 스냅샷 (2026-02-26 기준)
+## 3) 프로젝트 스냅샷 (2026-02-27 기준)
 
 - 제품: 사내 메신저 Desktop-First 전환
 - 서버: `Flask + Socket.IO + SQLite`
@@ -32,8 +32,8 @@ Gemini 기반 새 작업 세션이 시작될 때, 현재 프로젝트의 운영 
   - 카탈로그: `i18n/ko/*`, `i18n/en/*`
   - API 에러 호환: `error` 유지 + `error_code`, `error_localized`, `locale` 추가
 - 테스트 기준:
-  - `pytest tests -q` -> `136 passed`
-  - `pytest --maxfail=1` -> `136 passed`
+  - `pytest tests -q` -> `160 passed`
+  - `pytest --maxfail=1` -> `160 passed`
 - 배포 기준:
   - 서버 EXE: `messenger.spec`
   - 클라이언트 EXE: `messenger_client.spec`

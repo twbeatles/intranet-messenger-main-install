@@ -69,6 +69,7 @@ Keep existing features/business logic while removing browser dependency and movi
 
 - Socket.IO `connect` rejects unauthenticated sessions
 - on successful connect, server joins a personal room (`user_{user_id}`) plus membership rooms (`room_{room_id}`)
+- socket membership checks use a per-user room set cache first, then DB fallback + cache refresh on miss
 - `send_message`:
   - client-allowed types are `text|file|image` (`system` is server-internal only)
   - validates same-room `reply_to`
@@ -83,11 +84,15 @@ Keep existing features/business logic while removing browser dependency and movi
 ## Desktop Reliability Layer
 
 - outbound typing with debounce (default 500ms)
+- room-list rendering uses signature-based dedupe to avoid redundant full re-renders
+- `subscribe_rooms` is sent only when room ID membership actually changes
+- search uses 300ms debounce + short-lived remote-result cache (default 5s)
 - text/file sends share one pending/failed/retry + ACK pipeline
 - local `OutboxStore` (SQLite) persists unsent messages and restores them after restart
 - runtime token refresh loop (near-expiry + one-time retry on 401) improves long-session resiliency
 - own-message and own-typing checks are based on `user_id` (not nickname)
 - `read_updated`, `reaction_updated`, `message_edited`, `message_deleted` prefer incremental UI updates (fallback reload on miss)
+- message widget updates use a `message_id -> row` index to reduce incremental update costs
 - settings UI supports update channel selection (`stable`/`canary`)
 
 ## Security / Operations Notes

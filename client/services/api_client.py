@@ -231,10 +231,15 @@ class APIClient:
     def get_online_users(self) -> list[dict[str, Any]]:
         return self._request('GET', '/api/users/online')
 
-    def search_messages(self, query: str, room_id: int | None = None) -> list[dict[str, Any]]:
+    def search_messages(self, query: str, room_id: int | None = None, *, limit: int = 20) -> list[dict[str, Any]]:
         params: dict[str, Any] = {'q': query}
         if room_id:
             params['room_id'] = room_id
+        try:
+            normalized_limit = int(limit)
+        except (TypeError, ValueError):
+            normalized_limit = 20
+        params['limit'] = max(1, min(normalized_limit, 200))
         return self._request('GET', '/api/search', params=params)
 
     def check_client_update(self, client_version: str, channel: str | None = None) -> dict[str, Any]:

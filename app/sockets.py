@@ -14,7 +14,7 @@ from app.api_response import build_socket_error_payload
 from app.i18n import resolve_socket_locale
 from app.models import (
     update_user_status, get_user_by_id, is_room_member, is_room_admin,
-    create_message, create_file_message_with_record, update_last_read, get_unread_count, server_stats,
+    create_message, create_file_message_with_record, update_last_read, server_stats,
     get_user_rooms, edit_message, delete_message,
     get_user_session_token, get_message_room_id, get_message_reactions, get_message_by_client_msg_id,
     get_poll, get_pinned_messages, get_room_admins
@@ -32,6 +32,7 @@ online_users = {}  # {sid: user_id}
 user_sids = {}     # {user_id: [sid1, sid2, ...]} - 다중 세션 지원
 online_users_lock = Lock()
 stats_lock = Lock()
+_socketio_instance = None
 
 # 사용자별 캐시 (닉네임, 방 목록)
 user_cache = {}  # {user_id: {'nickname': str, 'rooms': [int], 'updated': float}}
@@ -88,6 +89,8 @@ def get_user_room_ids(user_id):
         cached = user_cache.get(user_id)
         # 캐시가 있고 TTL 이내면 사용
         if cached and (time.time() - cached.get('updated', 0)) < CACHE_TTL:
+            if 'room_set' not in cached:
+                cached['room_set'] = set(cached.get('rooms') or [])
             return cached.get('rooms', [])
     
     # 캐시 없거나 만료되면 DB에서 조회
@@ -103,6 +106,7 @@ def get_user_room_ids(user_id):
             if user_id not in user_cache:
                 user_cache[user_id] = {}
             user_cache[user_id]['rooms'] = room_ids
+            user_cache[user_id]['room_set'] = set(room_ids)
             user_cache[user_id]['updated'] = time.time()
         
         return room_ids
@@ -118,8 +122,97 @@ def invalidate_user_cache(user_id):
             del user_cache[user_id]
 
 
+def get_user_room_id_set(user_id: int) -> set[int]:
+    """사용자의 방 ID 집합 (멤버십 체크 핫패스 최적화)"""
+    with cache_lock:
+        cached = user_cache.get(user_id)
+        if cached and (time.time() - cached.get('updated', 0)) < CACHE_TTL:
+            room_set = cached.get('room_set')
+            if isinstance(room_set, set):
+                return set(room_set)
+            rebuilt = set(cached.get('rooms') or [])
+            cached['room_set'] = rebuilt
+            return set(rebuilt)
+    return set(get_user_room_ids(user_id))
+
+
+def user_has_room_access(user_id: int, room_id: int) -> bool:
+    """
+    Fast membership check:
+    1) cache hit path
+    2) DB fallback on cache miss
+    3) refresh cache when DB says member
+    """
+    try:
+        normalized_user_id = int(user_id)
+        normalized_room_id = int(room_id)
+    except (TypeError, ValueError):
+        return False
+    if normalized_user_id <= 0 or normalized_room_id <= 0:
+        return False
+
+    allowed_room_ids = get_user_room_id_set(normalized_user_id)
+    if normalized_room_id in allowed_room_ids:
+        return True
+
+    if not is_room_member(normalized_room_id, normalized_user_id):
+        return False
+
+    invalidate_user_cache(normalized_user_id)
+    refreshed = get_user_room_id_set(normalized_user_id)
+    return normalized_room_id in refreshed
+
+
+def force_remove_user_from_room(user_id: int, room_id: int) -> int:
+    """
+    Force all active sockets of a user to leave a room immediately.
+    Used by REST leave/kick paths to close the membership/socket timing gap.
+    """
+    try:
+        normalized_user_id = int(user_id)
+        normalized_room_id = int(room_id)
+    except (TypeError, ValueError):
+        return 0
+    if normalized_user_id <= 0 or normalized_room_id <= 0:
+        return 0
+
+    socketio_instance = _socketio_instance
+    if socketio_instance is None:
+        return 0
+
+    with online_users_lock:
+        sid_list = list(user_sids.get(normalized_user_id, []))
+    if not sid_list:
+        invalidate_user_cache(normalized_user_id)
+        return 0
+
+    room_name = f'room_{normalized_room_id}'
+    removed = 0
+    for sid in sid_list:
+        try:
+            socketio_instance.server.leave_room(  # type: ignore[attr-defined]
+                sid=sid,
+                room=room_name,
+                namespace='/',
+            )
+            removed += 1
+        except TypeError:
+            try:
+                socketio_instance.server.leave_room(sid, room_name)  # type: ignore[attr-defined]
+                removed += 1
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    invalidate_user_cache(normalized_user_id)
+    return removed
+
+
 def register_socket_events(socketio):
     """Socket.IO 이벤트 등록"""
+    global _socketio_instance
+    _socketio_instance = socketio
     
     @socketio.on('connect')
     def handle_connect():
@@ -224,15 +317,14 @@ def register_socket_events(socketio):
                 return
 
             user_id = session['user_id']
-            allowed = set(get_user_room_ids(user_id))
+            allowed = get_user_room_id_set(user_id)
             for rid in room_ids:
                 if rid in allowed:
                     join_room(f'room_{rid}')
                     continue
 
                 # Cache can be stale right after room creation/invite; fallback to DB check.
-                if is_room_member(rid, user_id):
-                    invalidate_user_cache(user_id)
+                if user_has_room_access(user_id, rid):
                     join_room(f'room_{rid}')
         except Exception as e:
             logger.error(f"Subscribe rooms error: {e}")
@@ -240,21 +332,20 @@ def register_socket_events(socketio):
     @socketio.on('join_room')
     def handle_join_room(data):
         try:
-            room_id = data.get('room_id')
+            room_id = data.get('room_id') if isinstance(data, dict) else None
             if room_id and 'user_id' in session:
-                # 캐시된 방 목록으로 빠른 확인
-                user_rooms = get_user_room_ids(session['user_id'])
-                if room_id in user_rooms:
-                    join_room(f'room_{room_id}')
-                    emit('joined_room', {'room_id': room_id})
+                try:
+                    normalized_room_id = int(room_id)
+                except (TypeError, ValueError):
+                    normalized_room_id = 0
+                if normalized_room_id <= 0:
+                    _emit_error_i18n('잘못된 대화방 ID입니다.')
+                    return
+                if user_has_room_access(session['user_id'], normalized_room_id):
+                    join_room(f'room_{normalized_room_id}')
+                    emit('joined_room', {'room_id': normalized_room_id})
                 else:
-                    # 캐시에 없으면 DB 직접 확인 (새로 초대된 경우)
-                    if is_room_member(room_id, session['user_id']):
-                        invalidate_user_cache(session['user_id'])
-                        join_room(f'room_{room_id}')
-                        emit('joined_room', {'room_id': room_id})
-                    else:
-                        _emit_error_i18n('대화방 접근 권한이 없습니다.')
+                    _emit_error_i18n('대화방 접근 권한이 없습니다.')
         except Exception as e:
             logger.error(f"Join room error: {e}")
     
@@ -330,12 +421,9 @@ def register_socket_events(socketio):
                         _emit_error_i18n('잘못된 요청입니다.')
                         return {'ok': False, 'error': '잘못된 요청입니다.'}
 
-            # 캐시된 방 목록으로 빠른 확인
-            user_rooms = get_user_room_ids(session['user_id'])
-            if room_id not in user_rooms:
-                if not is_room_member(room_id, session['user_id']):
-                    _emit_error_i18n('대화방 접근 권한이 없습니다.')
-                    return {'ok': False, 'error': '대화방 접근 권한이 없습니다.'}
+            if not user_has_room_access(session['user_id'], room_id):
+                _emit_error_i18n('대화방 접근 권한이 없습니다.')
+                return {'ok': False, 'error': '대화방 접근 권한이 없습니다.'}
 
             if reply_to is not None:
                 reply_room_id = get_message_room_id(reply_to)
@@ -417,7 +505,9 @@ def register_socket_events(socketio):
                     return {'ok': True, 'message_id': message_id}
                 if client_msg_id:
                     message['client_msg_id'] = client_msg_id
-                message['unread_count'] = get_unread_count(room_id, message['id'], session['user_id'])
+                # unread_count is currently not consumed by desktop real-time rendering.
+                # Keep field for compatibility while avoiding per-message COUNT query.
+                message['unread_count'] = 0
 
                 emit('new_message', message, room=f'room_{room_id}')
                 # broadcast 대신 해당 방 멤버들의 모든 세션에 전송
@@ -477,11 +567,17 @@ def register_socket_events(socketio):
             room_id = data.get('room_id')
             if not room_id:
                 return
+            try:
+                room_id = int(room_id)
+            except (TypeError, ValueError):
+                return
+            if room_id <= 0:
+                return
             
             user_id = session['user_id']
             
             # [v4.21] 멤버십 검증
-            if not is_room_member(room_id, user_id):
+            if not user_has_room_access(user_id, room_id):
                 return
             
             # [v4.14] 타이핑 레이트 리미팅

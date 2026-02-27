@@ -44,6 +44,9 @@ hiddenimports = sorted(
             "flask_limiter",
             "flask_wtf",
             "flask_compress",
+            # Compression backends used by Flask-Compress.
+            "brotli",
+            "brotlicffi",
             "socketio",
             "engineio",
             "engineio.async_drivers.gevent",

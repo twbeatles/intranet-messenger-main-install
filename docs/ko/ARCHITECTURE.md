@@ -69,6 +69,7 @@
 
 - Socket.IO 연결 시 인증 세션이 없으면 `connect` 즉시 거부
 - Socket `connect` 성공 시 사용자 전용 룸(`user_{user_id}`) + 소속 방 룸(`room_{room_id}`) join
+- 소켓 멤버십 확인은 사용자별 room set 캐시를 우선 사용하고, 캐시 miss 시 DB fallback + 캐시 갱신으로 처리
 - `send_message`:
   - 클라이언트 허용 타입은 `text|file|image` (`system`은 서버 내부 전용)
   - `reply_to`는 동일 방 메시지인지 검증
@@ -83,11 +84,15 @@
 ## 데스크톱 신뢰성 계층
 
 - 입력창 `typing` 이벤트 debounce 송신(기본 500ms)
+- 방 목록 렌더링은 시그니처 비교 기반 dedupe로 불필요한 전체 re-render를 억제
+- 소켓 `subscribe_rooms`는 room ID 집합 변경 시에만 재구독
+- 검색은 300ms debounce + 원격 검색 결과 단기 캐시(기본 5초)로 호출량 감소
 - 텍스트/파일 모두 메시지 송신 pending/failed/retry + ACK 파이프라인으로 처리
 - 로컬 `OutboxStore`(SQLite)로 미전송 메시지 영속화, 앱 재시작 시 복구
 - 런타임 토큰 refresh 루프(만료 임계치 접근/401 1회 재시도)로 장기 세션 복원력 강화
 - 메시지/타이핑 본인 판별은 닉네임이 아니라 `user_id` 기준으로 처리
 - `read_updated`, `reaction_updated`, `message_edited`, `message_deleted`는 증분 반영 우선(실패 시 fallback reload)
+- 메시지 위젯 갱신은 `message_id -> row` 인덱스로 처리해 증분 이벤트 비용을 줄임
 - 설정에서 업데이트 채널(`stable`/`canary`) 선택 지원
 
 ## 보안/운영 포인트

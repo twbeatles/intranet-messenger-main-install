@@ -196,6 +196,8 @@
 
 - `client_msg_id`가 요청에 있으면 브로드캐스트 payload에도 포함
 - 클라이언트는 이를 이용해 pending 메시지와 매칭 가능
+- `unread_count`는 호환 필드이며 성능 최적화 경로에서는 `0`으로 내려올 수 있음
+  - 정확한 unread 상태는 방 목록 API(`GET /api/rooms`) 기준으로 동기화
 
 ## 소켓 이벤트 전파 범위
 

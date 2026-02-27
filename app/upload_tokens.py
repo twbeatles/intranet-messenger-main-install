@@ -411,3 +411,70 @@ def cleanup_orphan_upload_files(*, grace_seconds: int | None = None) -> int:
     if removed > 0:
         logger.info(f"Cleaned up {removed} orphan upload files")
     return removed
+
+
+def cleanup_orphan_profile_files(*, grace_seconds: int | None = None) -> int:
+    """
+    users.profile_image 어디에도 참조되지 않는 profiles 하위 파일 정리.
+    실수 삭제 방지를 위해 grace 기간을 적용한다.
+    """
+    conn = _get_db()
+    cursor = conn.cursor()
+    now = datetime.now()
+    grace = ORPHAN_FILE_GRACE_SECONDS if grace_seconds is None else max(0, int(grace_seconds))
+    cutoff = now - timedelta(seconds=grace)
+
+    tracked_paths: set[str] = set()
+    try:
+        cursor.execute('SELECT profile_image FROM users WHERE profile_image IS NOT NULL AND profile_image <> ? ', ('',))
+        tracked_paths.update(_normalize_rel_path(row['profile_image']) for row in cursor.fetchall() if row['profile_image'])
+    except Exception:
+        tracked_paths = set()
+
+    held_paths: set[str] = set()
+    try:
+        cursor.execute(
+            '''
+            SELECT target_id
+            FROM legal_holds
+            WHERE hold_type = 'file_path'
+              AND active = 1
+            '''
+        )
+        held_paths.update(_normalize_rel_path(row['target_id']) for row in cursor.fetchall() if row['target_id'])
+    except Exception:
+        held_paths = set()
+
+    removed = 0
+    upload_root = os.path.realpath(_get_upload_folder())
+    profile_root = os.path.join(upload_root, 'profiles')
+    if not os.path.isdir(profile_root):
+        return 0
+
+    for root, _, files in os.walk(profile_root):
+        rel_dir = os.path.relpath(root, upload_root).replace('\\', '/')
+        if rel_dir == '.':
+            rel_dir = ''
+        for name in files:
+            if name == '.gitkeep':
+                continue
+            rel_path = _normalize_rel_path(os.path.join(rel_dir, name))
+            if rel_path in tracked_paths:
+                continue
+            if rel_path in held_paths:
+                continue
+
+            full_path = os.path.join(root, name)
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(full_path))
+            except Exception:
+                mtime = now
+            if mtime > cutoff:
+                continue
+
+            if _safe_file_delete(full_path):
+                removed += 1
+
+    if removed > 0:
+        logger.info(f"Cleaned up {removed} orphan profile files")
+    return removed
